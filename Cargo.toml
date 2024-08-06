@@ -1,0 +1,10 @@
+[package]
+name = "lis"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+futures-lite = "2.3.0"
+iroh = "0.22.0"
+tokio = "1.39.2"
