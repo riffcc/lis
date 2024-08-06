@@ -1,41 +1,65 @@
+use anyhow::Result;
 use futures_lite::StreamExt;
+use iroh::{client::docs::Doc, util::fs::path_to_key};
+use std::path::Path;
+
+struct Lis {
+    iroh_node: iroh::node::MemNode,
+}
+
+impl Lis {
+    async fn new() -> Result<Self> {
+        let lis = Lis {
+            iroh_node: iroh::node::Node::memory().spawn().await?, // TODO: option to move to disk node
+        };
+        Ok(lis)
+    }
+
+    /// Adds a file to new doc
+    /// Creates new doc
+    async fn add_file(&mut self, path: &Path) -> Result<()> {
+        // Create document
+        let mut doc = self.iroh_node.docs().create().await?;
+
+        self.add_file_to_doc(path, &mut doc).await?;
+
+        Ok(())
+    }
+
+    /// Adds a file to a previously created document
+    async fn add_file_to_doc(&mut self, path: &Path, doc: &mut Doc) -> Result<()> {
+        // read file
+        let bytes = std::fs::read(path)?;
+
+        let client = self.iroh_node.client();
+        let author = self.iroh_node.authors().create().await?; // TODO: add this to Lis
+
+        let key = path_to_key(&path, None, None)?; // TODO: use prefix and root (see path_to_key
+                                                   // docs)
+        doc.import_file(author, key, path, false)
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(())
+    }
+
+    /// Removes a doc
+    async fn rm_doc(&mut self, doc: &Doc) -> Result<()> {
+        self.iroh_node.docs().drop_doc(doc.id()).await
+    }
+}
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Create in memory iroh node
-    let node = iroh::node::Node::memory().spawn().await?;
+async fn main() -> Result<()> {
+    let mut lis = Lis::new().await?;
 
-    // Create document
-    let doc = node.docs().create().await?;
-    println!("Created document {}", doc.id());
+    lis.add_file(Path::new("/tmp/bigfile")).await;
 
-    println!("List of docs and their capabilities (0-Read, 1-Write):");
-
-    // Returns an array of `iroh.NamespaceAndCapability`s
-    // NamespaceId is the Doc's Id
-    // and the Capability is whether you have read or write access to the doc
-    let ns = node.docs().list().await?.collect::<Vec<_>>().await;
-    for entry in ns {
+    for entry in lis.iroh_node.docs().list().await?.collect::<Vec<_>>().await {
         let (ns, cap) = entry?;
         println!("\t{ns}\t{cap}");
     }
 
-    // Drop document
-    node.docs().drop_doc(doc.id()).await?;
-    println!("Dropped document {}", doc.id());
-
-    println!("List of docs and their capabilities (0-Read, 1-Write):");
-    let ns = node.docs().list().await?.collect::<Vec<_>>().await;
-    // List no longer contains the dropped doc
-    for entry in ns {
-        let (ns, cap) = entry?;
-        println!("\t{ns}\t{cap}");
-    }
     Ok(())
 }
-// Output:
-// Created document zdv4ciupnlhxzvydn3f227k7tkq3pdljie7de6gtsesghmuu6tyq
-// List of docs and their capabilities:
-// 	zdv4ciupnlhxzvydn3f227k7tkq3pdljie7de6gtsesghmuu6tyq	CapabilityKind.WRITE
-// Dropped document zdv4ciupnlhxzvydn3f227k7tkq3pdljie7de6gtsesghmuu6tyq
-// List of docs and their capabilities:
