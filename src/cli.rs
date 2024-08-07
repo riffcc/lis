@@ -6,9 +6,11 @@ use clap::{Parser, Subcommand};
 #[command(version, about, long_about = None)]
 pub struct Cli {
     /// If Iroh node is on disk set root dir (otherwise it's in memory)
-    #[arg(short, long)]
     #[arg(long, value_parser)]
-    disk: Option<PathBuf>,
+    pub root: PathBuf,
+
+    #[arg(short, long)]
+    pub overwrite: bool,
 
     // /// Sets a custom config file
     // #[arg(short, long, value_name = "FILE")]

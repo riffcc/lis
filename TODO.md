@@ -1,0 +1,2 @@
+- waku for message passing
+- architecture: https://excalidraw.com/#json=Z5wK1wkZrwUyeAbpT_oRE,OYn8RCSqbvIsuLdZFqXFhw
