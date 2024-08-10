@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use futures_lite::StreamExt;
+use iroh::docs::store::Query;
 use iroh::{client::docs::Doc, node::Node, util::fs::path_to_key};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,6 @@ pub use cli::{Cli, Commands};
 
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
-    files: Doc,
     author: iroh::docs::AuthorId,
     root: PathBuf,
 }
@@ -29,12 +29,10 @@ impl Lis {
 
         let iroh_node = iroh::node::Node::persistent(root).await?.spawn().await?;
         let author = iroh_node.authors().create().await?;
-        let doc = iroh_node.docs().create().await?;
 
         let lis = Lis {
             iroh_node,
             author,
-            files: doc,
             root: root.clone(),
         };
         Ok(lis)
@@ -43,10 +41,29 @@ impl Lis {
     /// List all files in node
     pub async fn list(&self) -> Result<()> {
         // let files = Vec::new();
+        // get all the entries with default filtering and sorting
+
         let mut doc_ids = self.iroh_node.docs().list().await?;
         while let Some(doc_id) = doc_ids.next().await {
             let (doc_id, kind) = doc_id?;
-            println!("\t{doc_id}: {kind}");
+            println!("doc:{doc_id} ({kind})");
+            if let Some(doc) = self.iroh_node.docs().open(doc_id).await? {
+                let query = Query::all().build();
+                let entries = doc.get_many(query).await?.collect::<Vec<_>>().await;
+
+                for entry in entries {
+                    let entry = entry?;
+                    let key = entry.key();
+                    let hash = entry.content_hash();
+                    let content = entry.content_bytes(self.iroh_node.client()).await?;
+                    println!(
+                        "{} : {} (hash: {})",
+                        std::str::from_utf8(key)?,
+                        std::str::from_utf8(&content)?,
+                        hash
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -85,8 +102,8 @@ impl Lis {
         // key = /path/to/iroh/node/filename.txt
         let key = path_to_key(src_path, Some(prefix), Some(root));
 
-        self.files
-            .import_file(self.author, key?, src_path, false)
+        let doc = self.iroh_node.docs().create().await?;
+        doc.import_file(self.author, key?, src_path, false)
             .await?
             .collect::<Vec<_>>()
             .await;

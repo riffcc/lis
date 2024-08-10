@@ -5,6 +5,11 @@
 - join network through node x
 
 
+architecture
+    - only one document (root document)
+        filename: blob hash
+    - updating a file means readding it as a new blob and resetting the root document to point to it
+
 
 - fuse
 - waku for message passing

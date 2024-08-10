@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use futures_lite::StreamExt;
 
 use lis::{Cli, Commands, Lis};
 
