@@ -9,13 +9,13 @@ async fn main() -> Result<()> {
     let mut lis = Lis::new(&cli.root, cli.overwrite).await?;
 
     match &cli.command {
-        Commands::Add { paths } => {
+        Commands::Put { paths } => {
             for path in paths {
                 if path.is_file() {
                     println!(
                         "Added {} (key: {})",
                         path.display(),
-                        lis.add_file(path.as_path()).await?
+                        lis.put_file(path.as_path()).await?
                     );
                 } else if path.is_dir() {
                     todo!()
@@ -25,7 +25,20 @@ async fn main() -> Result<()> {
         Commands::List {} => {
             lis.list().await?;
         }
-        &Commands::Get { .. } | &Commands::Rm { .. } => todo!(),
+        Commands::Get { paths } => {
+            for path in paths {
+                let content = lis.get_file(path.as_path()).await?;
+                // Convert to &str
+                let ascii_content = std::str::from_utf8(&content)?;
+                println!("{}\n\n{}", path.display(), ascii_content);
+            }
+        }
+        Commands::Rm { paths } => {
+            for path in paths {
+                let key = lis.rm_file(path.as_path()).await?;
+                println!("Removed {key}");
+            }
+        }
     }
 
     Ok(())

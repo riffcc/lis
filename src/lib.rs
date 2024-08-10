@@ -11,7 +11,7 @@ mod manifest;
 use manifest::Manifest;
 
 mod util;
-use util::key_from_file;
+use util::{key_from_file, key_to_string};
 
 mod cli;
 pub use cli::{Cli, Commands};
@@ -97,7 +97,7 @@ impl Lis {
 
     /// Creates a new Doc and adds a file to it
     /// Returns the key to the added file upon success
-    pub async fn add_file(&mut self, src_path: &Path) -> Result<String> {
+    pub async fn put_file(&mut self, src_path: &Path) -> Result<String> {
         if !src_path.exists() {
             return Err(anyhow!("File {} not found", src_path.display()));
         }
@@ -106,30 +106,35 @@ impl Lis {
         }
 
         let full_src_path = fs::canonicalize(&src_path)?;
-        self.add_file_to_doc(full_src_path.as_path()).await
+        self.put_file_to_doc(full_src_path.as_path()).await
     }
 
-    /// Adds a file to a previously created document
+    /// Puts a file to a previously created document
     /// Returns the key to the added file upon success
-    pub async fn add_file_to_doc(&mut self, path: &Path) -> Result<String> {
+    pub async fn put_file_to_doc(&mut self, path: &Path) -> Result<String> {
         let key = key_from_file(&self.root, path)?;
+
+        // if key already in filesystem, remove it first
+        let query = Query::key_exact(key.clone());
+        if self.files_doc.get_one(query).await?.is_some() {
+            self.files_doc.del(self.author, key.clone()).await?; // delete old entry
+        }
+
         self.files_doc
             .import_file(self.author, key.clone(), path, false)
             .await?
             .collect::<Vec<_>>()
             .await;
 
-        let key_str = std::str::from_utf8(key.as_ref())?;
-
-        Ok(key_str.to_string())
+        key_to_string(key)
     }
 
     /// Remove a file
-    pub async fn rm_file(&mut self, path: &Path) -> Result<()> {
+    pub async fn rm_file(&mut self, path: &Path) -> Result<String> {
         let key = key_from_file(&self.root, path)?;
 
-        self.files_doc.del(self.author, key).await?;
-        Ok(())
+        self.files_doc.del(self.author, key.clone()).await?;
+        key_to_string(key)
     }
 
     /// Get contents of a file

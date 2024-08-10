@@ -24,3 +24,8 @@ pub fn key_from_file(root: &Path, path: &Path) -> Result<Bytes> {
     // key = /path/to/iroh/node/filename.txt
     path_to_key(path, Some(prefix), Some(root))
 }
+
+pub fn key_to_string(key: Bytes) -> Result<String> {
+    let key_str = std::str::from_utf8(key.as_ref())?;
+    Ok(key_str.to_string())
+}

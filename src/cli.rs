@@ -25,26 +25,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Adds files
+    /// Puts files into node
     /// Paths that don't exist or aren't accessible are ignored
-    Add {
-        /// paths to add
-        paths: Vec<PathBuf>,
-    },
+    Put { paths: Vec<PathBuf> },
     /// List files on filesystem
     /// Paths that don't exist or aren't accessible are ignored
     #[command(alias = "ls")]
     List {},
     /// Gets files that are not currently locally accessible
     /// Paths that don't exist or aren't accessible are ignored
-    Get {
-        /// paths to get
-        paths: Vec<PathBuf>,
-    },
+    Get { paths: Vec<PathBuf> },
     /// Removes files or dirs to filesystem
     /// Paths that don't exist or aren't accessible are ignored
-    Rm {
-        /// paths to remove
-        paths: Vec<PathBuf>,
-    },
+    Rm { paths: Vec<PathBuf> },
 }

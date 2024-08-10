@@ -20,6 +20,12 @@ List files in the node at `/path/to/node/directory`
 lis --root /path/to/node/directory ls
 ```
 
+Get contents of `README.md` file in the node at `/path/to/node/directory`
+```bash
+lis --root /path/to/node/directory put README.md
+lis --root /path/to/node/directory get README.md
+```
+
 
 
 
