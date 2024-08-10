@@ -1,7 +1,6 @@
-- add file
-- list files
-- remove file
-- get file and put it in path x
+- integrate get file
+- integrate remove file
+- implement add dir
 - join network through node x
 
 
