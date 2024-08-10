@@ -69,7 +69,8 @@ impl Lis {
     }
 
     /// Creates a new Doc and adds a file to it
-    pub async fn add_file(&mut self, src_path: &Path) -> Result<()> {
+    /// Returns the key to the added file upon success
+    pub async fn add_file(&mut self, src_path: &Path) -> Result<String> {
         if !src_path.exists() {
             return Err(anyhow!("File {} not found", src_path.display()));
         }
@@ -77,21 +78,25 @@ impl Lis {
             return Err(anyhow!("Path must be a file"));
         }
 
-        self.add_file_to_doc(src_path).await?;
+        let doc = self.iroh_node.docs().create().await?;
 
-        Ok(())
+        let full_src_path = fs::canonicalize(&src_path)?;
+        self.add_file_to_doc(full_src_path.as_path(), doc).await
     }
 
     /// Adds a file to a previously created document
-    pub async fn add_file_to_doc(&mut self, src_path: &Path) -> Result<()> {
+    /// Returns the key to the added file upon success
+    pub async fn add_file_to_doc(&mut self, path: &Path, doc: Doc) -> Result<String> {
         // Key is self.root + / + filename
-        let prefix = self
+        let mut prefix = self
             .root
             .as_os_str()
             .to_owned()
             .into_string()
             .expect("Could not make file path into string");
-        let root: PathBuf = src_path
+        prefix.push('/');
+
+        let root: PathBuf = path
             .parent()
             .ok_or(anyhow!("Could not find parent for file"))?
             .into();
@@ -100,15 +105,16 @@ impl Lis {
         // prefix = /path/to/iroh/node
         // root = /os/path/
         // key = /path/to/iroh/node/filename.txt
-        let key = path_to_key(src_path, Some(prefix), Some(root));
+        let key = path_to_key(path, Some(prefix), Some(root))?;
 
-        let doc = self.iroh_node.docs().create().await?;
-        doc.import_file(self.author, key?, src_path, false)
+        doc.import_file(self.author, key.clone(), path, false)
             .await?
             .collect::<Vec<_>>()
             .await;
 
-        Ok(())
+        let key_str = std::str::from_utf8(key.as_ref())?;
+
+        Ok(key_str.to_string())
     }
 
     /// Removes a doc

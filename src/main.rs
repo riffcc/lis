@@ -11,7 +11,15 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Add { paths } => {
             for path in paths {
-                lis.add_file(path.as_path()).await?;
+                if path.is_file() {
+                    println!(
+                        "Added {} (key: {})",
+                        path.display(),
+                        lis.add_file(path.as_path()).await?
+                    );
+                } else if path.is_dir() {
+                    todo!()
+                } // TODO: implement
             }
         }
         Commands::List {} => {
