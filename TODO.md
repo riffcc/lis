@@ -1,6 +1,6 @@
+- add file
 - list files
-- add file to network
-- remove file from network
+- remove file
 - get file and put it in path x
 - join network through node x
 

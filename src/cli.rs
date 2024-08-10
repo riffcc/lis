@@ -20,18 +20,22 @@ pub struct Cli {
     // #[arg(short, long, action = clap::ArgAction::Count)]
     // debug: u8,
     #[command(subcommand)]
-    command: Option<Commands>,
+    pub command: Commands,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Adds files or dirs to filesystem
+pub enum Commands {
+    /// Adds files
     /// Paths that don't exist or aren't accessible are ignored
     Add {
         /// paths to add
         paths: Vec<PathBuf>,
     },
-    /// Gets files or dirs from filesystem
+    /// List files on filesystem
+    /// Paths that don't exist or aren't accessible are ignored
+    #[command(alias = "ls")]
+    List {},
+    /// Gets files that are not currently locally accessible
     /// Paths that don't exist or aren't accessible are ignored
     Get {
         /// paths to get

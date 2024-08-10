@@ -1,16 +1,19 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures_lite::StreamExt;
 use iroh::{client::docs::Doc, node::Node, util::fs::path_to_key};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 mod cli;
-pub use cli::Cli;
+pub use cli::{Cli, Commands};
 
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
+    files: Doc,
     author: iroh::docs::AuthorId,
+    root: PathBuf,
 }
+
 impl Lis {
     /// Creates new Lis node
     /// If `root` path does not exist, it is created with `mkdir -p`
@@ -26,26 +29,64 @@ impl Lis {
 
         let iroh_node = iroh::node::Node::persistent(root).await?.spawn().await?;
         let author = iroh_node.authors().create().await?;
-        let lis = Lis { iroh_node, author };
+        let doc = iroh_node.docs().create().await?;
+
+        let lis = Lis {
+            iroh_node,
+            author,
+            files: doc,
+            root: root.clone(),
+        };
         Ok(lis)
     }
 
-    /// Adds a file to new doc
-    /// Creates new doc
-    pub async fn add_file(&mut self, path: &Path) -> Result<()> {
-        // Create document
-        let mut doc = self.iroh_node.docs().create().await?;
+    /// List all files in node
+    pub async fn list(&self) -> Result<()> {
+        // let files = Vec::new();
+        let mut doc_ids = self.iroh_node.docs().list().await?;
+        while let Some(doc_id) = doc_ids.next().await {
+            let (doc_id, kind) = doc_id?;
+            println!("\t{doc_id}: {kind}");
+        }
+        Ok(())
+    }
 
-        self.add_file_to_doc(path, &mut doc).await?;
+    /// Creates a new Doc and adds a file to it
+    pub async fn add_file(&mut self, src_path: &Path) -> Result<()> {
+        if !src_path.exists() {
+            return Err(anyhow!("File {} not found", src_path.display()));
+        }
+        if !src_path.is_file() {
+            return Err(anyhow!("Path must be a file"));
+        }
+
+        self.add_file_to_doc(src_path).await?;
 
         Ok(())
     }
 
     /// Adds a file to a previously created document
-    pub async fn add_file_to_doc(&mut self, path: &Path, doc: &mut Doc) -> Result<()> {
-        let key = path_to_key(&path, None, None)?; // TODO: use prefix and root (see path_to_key
-                                                   // docs)
-        doc.import_file(self.author, key, path, false)
+    pub async fn add_file_to_doc(&mut self, src_path: &Path) -> Result<()> {
+        // Key is self.root + / + filename
+        let prefix = self
+            .root
+            .as_os_str()
+            .to_owned()
+            .into_string()
+            .expect("Could not make file path into string");
+        let root: PathBuf = src_path
+            .parent()
+            .ok_or(anyhow!("Could not find parent for file"))?
+            .into();
+
+        // src_path = /os/path/filename.txt
+        // prefix = /path/to/iroh/node
+        // root = /os/path/
+        // key = /path/to/iroh/node/filename.txt
+        let key = path_to_key(src_path, Some(prefix), Some(root));
+
+        self.files
+            .import_file(self.author, key?, src_path, false)
             .await?
             .collect::<Vec<_>>()
             .await;

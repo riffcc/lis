@@ -1,19 +1,24 @@
 use anyhow::Result;
 use clap::Parser;
 use futures_lite::StreamExt;
-use lis::{Cli, Lis};
-use std::path::Path;
+
+use lis::{Cli, Commands, Lis};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut lis = Lis::new(&cli.root, cli.overwrite).await?;
 
-    lis.add_file(Path::new("/tmp/bigfile")).await?;
-
-    for entry in lis.iroh_node.docs().list().await?.collect::<Vec<_>>().await {
-        let (ns, cap) = entry?;
-        println!("\t{ns}\t{cap}");
+    match &cli.command {
+        Commands::Add { paths } => {
+            for path in paths {
+                lis.add_file(path.as_path()).await?;
+            }
+        }
+        Commands::List {} => {
+            lis.list().await?;
+        }
+        &Commands::Get { .. } | &Commands::Rm { .. } => todo!(),
     }
 
     Ok(())
