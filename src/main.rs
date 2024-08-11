@@ -23,7 +23,21 @@ async fn main() -> Result<()> {
             }
         }
         Commands::List {} => {
-            lis.list().await?;
+            let entries = lis.list().await?;
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let key = entry.key();
+                    let hash = entry.content_hash();
+                    let author = entry.author();
+                    // let content = entry.content_bytes(self.iroh_node.client()).await?;
+                    println!(
+                        "{} (author: {}; hash: {})",
+                        std::str::from_utf8(key)?,
+                        author.fmt_short(),
+                        hash.fmt_short()
+                    );
+                }
+            }
         }
         Commands::Get { paths } => {
             for path in paths {

@@ -1,5 +1,3 @@
-- fix remove not working
-    - add tests
 - add File type (filename, hash on files doc, size, content (bytes))
 - integrate get file
 - integrate remove file

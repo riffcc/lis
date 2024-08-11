@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures_lite::StreamExt;
-use iroh::docs::store::Query;
-use iroh::{client::docs::Doc, docs::NamespaceId, node::Node};
+use iroh::{
+    client::docs::{Doc, Entry},
+    docs::{store::Query, NamespaceId},
+    node::Node,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -18,7 +21,6 @@ pub use cli::{Cli, Commands};
 
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
-    author: iroh::docs::AuthorId,
     manifest: Manifest,
     files_doc: Doc,
     root: PathBuf,
@@ -34,17 +36,18 @@ impl Lis {
             // TODO: add prompt for overwrite: are you sure? [Y/n]
 
             // remove old root dir if one existed before
-            fs::remove_dir_all(root)?;
+            let _ = fs::remove_dir_all(root); // don't care about result. if dir not exists it's
+                                              // fine
         }
         // create root path if not exists
         fs::create_dir_all(root)?;
 
         let iroh_node = iroh::node::Node::persistent(root).await?.spawn().await?;
-        let author = iroh_node.authors().create().await?;
 
         // if manifest.json file found, load it
         // manifest.json holds data about the Files document (which points to all files)
         let manifest_path = root.join("manifest.json");
+
         let (manifest, files_doc): (Manifest, Doc) = if manifest_path.exists() {
             // load manifest
             let file_content = fs::read_to_string(manifest_path)?;
@@ -54,20 +57,25 @@ impl Lis {
                 .open(NamespaceId::from_str(manifest.files_doc_id.as_str())?)
                 .await?
                 .ok_or_else(|| anyhow!("no files doc found"))?;
+
             (manifest, files_doc)
         } else {
             // create new Files doc and manifest file
             let files_doc = iroh_node.docs().create().await?;
             let manifest = Manifest::new(files_doc.id().to_string());
+
             // write to manifest.json file
             let json_string = serde_json::to_string(&manifest)?;
             fs::write(manifest_path, json_string)?;
+
+            // create default author on the first time
+            let author = iroh_node.authors().create().await?;
+            iroh_node.authors().set_default(author).await?;
             (manifest, files_doc)
         };
 
         let lis = Lis {
             iroh_node,
-            author,
             manifest,
             files_doc,
             root: root.clone(),
@@ -76,7 +84,7 @@ impl Lis {
     }
 
     /// List all files in node
-    pub async fn list(&self) -> Result<()> {
+    pub async fn list(&self) -> Result<Vec<Result<Entry>>> {
         let query = Query::all().build();
         let entries = self
             .files_doc
@@ -85,14 +93,7 @@ impl Lis {
             .collect::<Vec<_>>()
             .await;
 
-        for entry in entries {
-            let entry = entry?;
-            let key = entry.key();
-            let hash = entry.content_hash();
-            // let content = entry.content_bytes(self.iroh_node.client()).await?;
-            println!("{} (hash: {})", std::str::from_utf8(key)?, hash);
-        }
-        Ok(())
+        Ok(entries)
     }
 
     /// Creates a new Doc and adds a file to it
@@ -117,11 +118,18 @@ impl Lis {
         // if key already in filesystem, remove it first
         let query = Query::key_exact(key.clone());
         if self.files_doc.get_one(query).await?.is_some() {
-            self.files_doc.del(self.author, key.clone()).await?; // delete old entry
+            self.files_doc
+                .del(self.iroh_node.authors().default().await?, key.clone())
+                .await?; // delete old entry
         }
 
         self.files_doc
-            .import_file(self.author, key.clone(), path, false)
+            .import_file(
+                self.iroh_node.authors().default().await?,
+                key.clone(),
+                path,
+                false,
+            )
             .await?
             .collect::<Vec<_>>()
             .await;
@@ -133,7 +141,9 @@ impl Lis {
     pub async fn rm_file(&mut self, path: &Path) -> Result<String> {
         let key = key_from_file(&self.root, path)?;
 
-        self.files_doc.del(self.author, key.clone()).await?;
+        self.files_doc
+            .del(self.iroh_node.authors().default().await?, key.clone())
+            .await?;
         key_to_string(key)
     }
 
@@ -150,5 +160,60 @@ impl Lis {
             .ok_or_else(|| anyhow!("entry not found"))?;
 
         entry.content_bytes(self.iroh_node.client()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::{NamedTempFile, TempDir};
+
+    async fn setup_lis() -> Lis {
+        let tmp_dir = TempDir::new().expect("Could not create temp dir");
+        let root = PathBuf::from(tmp_dir.path());
+        let overwrite = true;
+        Lis::new(&root, overwrite)
+            .await
+            .expect("Could not create new Lis node")
+    }
+
+    #[tokio::test]
+    async fn test_put_file() {
+        let mut lis = setup_lis().await;
+
+        // Create a file inside of `env::temp_dir()`.
+        let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
+        let content = "Brian was here. Briefly.";
+        write!(file, "{}", content).expect("Could not write to named temp file");
+
+        lis.put_file(file.path()).await.expect("Could not put file"); // should succeed
+        let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
+        assert_eq!(get_content, content);
+    }
+
+    #[tokio::test]
+    async fn test_double_put() {
+        let mut lis = setup_lis().await;
+
+        // Create a file inside of `env::temp_dir()`.
+        let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
+        let content = "Brian was here. Briefly.";
+        write!(file, "{}", content).expect("Could not write to named temp file");
+
+        // put file twice
+        lis.put_file(file.path()).await.expect("Could not put file"); // should succeed
+
+        // but second time has more content
+        let more_content = " more";
+        write!(file, "{}", more_content).expect("Could not write to named temp file");
+        lis.put_file(file.path()).await.expect("Could not put file"); // should succeed
+
+        let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
+
+        let files = lis.list().await.expect("Could not get file"); // should succeed
+
+        assert_eq!(get_content, "Brian was here. Briefly. more"); // new content should be there
+        assert_eq!(files.len(), 1); // there should only be one file
     }
 }
