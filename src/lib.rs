@@ -14,7 +14,7 @@ mod manifest;
 use manifest::Manifest;
 
 mod util;
-use util::{key_from_file, key_to_string};
+use util::{get_paths_in_dir, key_from_file, key_to_string};
 
 mod cli;
 pub use cli::{Cli, Commands};
@@ -96,9 +96,35 @@ impl Lis {
         Ok(entries)
     }
 
+    /// Adds files and directories to Lis
+    /// Returns `(path, key)` pairs of the added file upon success
+    pub async fn put(&mut self, src_path: &Path) -> Result<Vec<(PathBuf, String)>> {
+        if !src_path.exists() {
+            return Err(anyhow!("Path {} does not exist", src_path.display()));
+        }
+
+        let full_src_path = fs::canonicalize(&src_path)?;
+        if src_path.is_file() {
+            Ok(vec![(
+                src_path.to_path_buf(),
+                self.put_file_to_doc(full_src_path.as_path()).await?,
+            )])
+        } else {
+            let paths = get_paths_in_dir(&full_src_path)?;
+
+            let mut entries = Vec::new();
+            for path in paths {
+                println!("adding {}", path.display());
+                entries.push(self.put_file(&path).await?);
+            }
+
+            Ok(entries)
+        }
+    }
+
     /// Creates a new Doc and adds a file to it
-    /// Returns the key to the added file upon success
-    pub async fn put_file(&mut self, src_path: &Path) -> Result<String> {
+    /// Returns a `(path, key)` pair of the added file upon success
+    async fn put_file(&mut self, src_path: &Path) -> Result<(PathBuf, String)> {
         if !src_path.exists() {
             return Err(anyhow!("File {} not found", src_path.display()));
         }
@@ -107,12 +133,15 @@ impl Lis {
         }
 
         let full_src_path = fs::canonicalize(&src_path)?;
-        self.put_file_to_doc(full_src_path.as_path()).await
+        Ok((
+            src_path.to_path_buf(),
+            self.put_file_to_doc(full_src_path.as_path()).await?,
+        ))
     }
 
     /// Puts a file to a previously created document
     /// Returns the key to the added file upon success
-    pub async fn put_file_to_doc(&mut self, path: &Path) -> Result<String> {
+    async fn put_file_to_doc(&mut self, path: &Path) -> Result<String> {
         let key = key_from_file(&self.root, path)?;
 
         // if key already in filesystem, remove it first
@@ -179,21 +208,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_file() {
+    async fn put_dir() {
         let mut lis = setup_lis().await;
 
-        // Create a file inside of `env::temp_dir()`.
-        let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
+        let tmp_dir = TempDir::new().expect("Could not create temp dir");
+        let file_path = tmp_dir.path();
+        let mut file = NamedTempFile::new_in(file_path).expect("Could not create named temp file");
         let content = "Brian was here. Briefly.";
         write!(file, "{}", content).expect("Could not write to named temp file");
 
-        lis.put_file(file.path()).await.expect("Could not put file"); // should succeed
+        lis.put(file.path()).await.expect("Could not put file"); // should succeed
         let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
         assert_eq!(get_content, content);
     }
 
     #[tokio::test]
-    async fn test_double_put() {
+    async fn double_put() {
         let mut lis = setup_lis().await;
 
         // Create a file inside of `env::temp_dir()`.
@@ -202,12 +232,37 @@ mod tests {
         write!(file, "{}", content).expect("Could not write to named temp file");
 
         // put file twice
-        lis.put_file(file.path()).await.expect("Could not put file"); // should succeed
+        lis.put(file.path()).await.expect("Could not put file"); // should succeed
 
         // but second time has more content
         let more_content = " more";
         write!(file, "{}", more_content).expect("Could not write to named temp file");
-        lis.put_file(file.path()).await.expect("Could not put file"); // should succeed
+        lis.put(file.path()).await.expect("Could not put file"); // should succeed
+
+        let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
+
+        let files = lis.list().await.expect("Could not get file"); // should succeed
+
+        assert_eq!(get_content, "Brian was here. Briefly. more"); // new content should be there
+        assert_eq!(files.len(), 1); // there should only be one file
+    }
+
+    #[tokio::test]
+    async fn put_file() {
+        let mut lis = setup_lis().await;
+
+        // Create a file inside of `env::temp_dir()`.
+        let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
+        let content = "Brian was here. Briefly.";
+        write!(file, "{}", content).expect("Could not write to named temp file");
+
+        // put file twice
+        lis.put(file.path()).await.expect("Could not put file"); // should succeed
+
+        // but second time has more content
+        let more_content = " more";
+        write!(file, "{}", more_content).expect("Could not write to named temp file");
+        lis.put(file.path()).await.expect("Could not put file"); // should succeed
 
         let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
 

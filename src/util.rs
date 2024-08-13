@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use iroh::util::fs::path_to_key;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// Generates a canonicalized key derived from `path` given a node's `root` dir path
 pub fn key_from_file(root: &Path, path: &Path) -> Result<Bytes> {
@@ -28,4 +31,23 @@ pub fn key_from_file(root: &Path, path: &Path) -> Result<Bytes> {
 pub fn key_to_string(key: Bytes) -> Result<String> {
     let key_str = std::str::from_utf8(key.as_ref())?;
     Ok(key_str.to_string())
+}
+
+pub fn get_paths_in_dir(dir_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+
+    // Read the directory contents
+    for entry in fs::read_dir(dir_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        paths.append(&mut if path.is_file() {
+            vec![path]
+        } else if path.is_dir() {
+            get_paths_in_dir(&path)?
+        } else {
+            anyhow::bail!("{} has an unsupported path type", path.display());
+        });
+    }
+
+    Ok(paths)
 }

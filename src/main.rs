@@ -11,15 +11,11 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Put { paths } => {
             for path in paths {
-                if path.is_file() {
-                    println!(
-                        "Added {} (key: {})",
-                        path.display(),
-                        lis.put_file(path.as_path()).await?
-                    );
-                } else if path.is_dir() {
-                    todo!()
-                } // TODO: implement
+                println!(
+                    "Added {} (keys: {:#?})",
+                    path.display(),
+                    lis.put(path.as_path()).await?
+                );
             }
         }
         Commands::List {} => {
