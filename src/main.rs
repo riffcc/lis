@@ -24,14 +24,9 @@ async fn main() -> Result<()> {
                 if let Ok(entry) = entry {
                     let key = entry.key();
                     let hash = entry.content_hash();
-                    let author = entry.author();
+                    // let author = entry.author();
                     // let content = entry.content_bytes(self.iroh_node.client()).await?;
-                    println!(
-                        "{} (author: {}; hash: {})",
-                        std::str::from_utf8(key)?,
-                        author.fmt_short(),
-                        hash.fmt_short()
-                    );
+                    println!("{} ({})", std::str::from_utf8(key)?, hash.fmt_short());
                 }
             }
         }
