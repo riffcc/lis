@@ -4,6 +4,7 @@ use futures_lite::StreamExt;
 use iroh::{
     client::docs::{Doc, Entry},
     docs::{store::Query, NamespaceId},
+    net::ticket::NodeTicket,
     node::Node,
 };
 use std::fs;
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 mod manifest;
-use manifest::Manifest;
+pub use manifest::Manifest;
 
 mod util;
 use util::{get_paths_in_dir, key_from_file, key_to_string};
@@ -21,7 +22,7 @@ pub use cli::{Cli, Commands};
 
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
-    manifest: Manifest,
+    pub manifest: Manifest,
     files_doc: Doc,
     root: PathBuf,
 }
@@ -189,6 +190,16 @@ impl Lis {
             .ok_or_else(|| anyhow!("entry not found"))?;
 
         entry.content_bytes(self.iroh_node.client()).await
+    }
+    /// Generate a NodeTicket invite
+    pub async fn invite(&self) -> Result<NodeTicket> {
+        let node_addr = self.iroh_node.net().node_addr().await?;
+        NodeTicket::new(node_addr)
+    }
+    /// Joins a network from a NodeTicket invite
+    pub fn join(&mut self, ticket: &NodeTicket) -> Result<()> {
+        let endpoint = self.iroh_node.endpoint();
+        endpoint.add_node_addr(ticket.node_addr().clone())
     }
 }
 

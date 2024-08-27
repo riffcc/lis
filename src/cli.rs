@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use iroh::net::ticket::NodeTicket;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -38,4 +39,8 @@ pub enum Commands {
     /// Removes files or dirs to filesystem
     /// Paths that don't exist or aren't accessible are ignored
     Rm { paths: Vec<PathBuf> },
+    /// Joins a network using the given ticket
+    Join { ticket: NodeTicket },
+    /// Generates a ticket for joining a network with Join
+    Invite {},
 }

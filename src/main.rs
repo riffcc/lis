@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Parser;
+use std::io::Write;
 
-use lis::{Cli, Commands, Lis};
+use lis::{Cli, Commands, Lis, Manifest};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +44,60 @@ async fn main() -> Result<()> {
                 let key = lis.rm_file(path.as_path()).await?;
                 println!("Removed {key}");
             }
+        }
+        Commands::Join { ticket } => {
+            lis.join(ticket)?;
+
+            print!("Connecting...");
+            std::io::stdout().flush()?;
+            let conn = lis
+                .iroh_node
+                .endpoint()
+                .connect(ticket.node_addr().clone(), iroh::blobs::protocol::ALPN)
+                .await?;
+            println!("connected!");
+
+            print!("Receiving manifest...");
+            std::io::stdout().flush()?;
+            let mut stream = conn.accept_uni().await?;
+            let manifest: Manifest = serde_json::from_slice(&stream.read_to_end(2048).await?)?;
+            println!("ok.");
+            println!("{:#?}", manifest);
+
+            print!("Saving manifest...");
+            // TODO
+            println!("ok.");
+
+            println!("All done.");
+        }
+        Commands::Invite {} => {
+            let ticket = lis.invite().await?;
+            println!("Invite ticket: {ticket}");
+            println!("\n\n\tlis --root <some_root> join {ticket}\n");
+
+            print!("Waiting for remote node to connect...");
+            std::io::stdout().flush()?;
+            let conn = lis
+                .iroh_node
+                .endpoint()
+                .accept()
+                .await
+                .ok_or(anyhow!("Unable to accept connection."))?
+                .await?;
+            println!("connected!");
+
+            print!("Updating manifest...");
+            // TODO update manifest
+            println!("ok.");
+
+            print!("Sending manifest...");
+            let serialized_manifest = serde_json::to_string(&lis.manifest)?;
+            let mut stream = conn.open_uni().await?;
+            stream.write_all(&serialized_manifest.as_bytes()).await?;
+            stream.finish().await?;
+            println!("ok.");
+
+            println!("All done.");
         }
     }
 
