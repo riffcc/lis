@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use iroh::net::ticket::NodeTicket;
 
 #[derive(Parser)]
@@ -12,6 +12,10 @@ pub struct Cli {
 
     #[arg(short, long)]
     pub overwrite: bool,
+
+    /// Verbose mode (-v, -vv, -vvv, -vvvv)
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbosity: u8,
 
     // /// Sets a custom config file
     // #[arg(short, long, value_name = "FILE")]

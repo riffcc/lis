@@ -1,7 +1,9 @@
 // use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyDirectory, Request, FUSE_ROOT_ID};
 use fuser::{FileAttr, FileType, ReplyAttr, ReplyDirectory, Request};
 use libc::ENOSYS;
-use std::os::unix::ffi::OsStrExt;
+#[allow(unused)]
+use log::{debug, error, info, warn, LevelFilter};
+#[allow(unused)]
 use std::{
     ffi::OsStr,
     os::unix::ffi::OsStrExt,
@@ -13,7 +15,7 @@ use crate::Lis;
 
 impl fuser::Filesystem for Lis {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        println!("getattr(ino={ino})");
+        debug!("getattr(ino={ino})");
         let ts = SystemTime::now();
         let attr = FileAttr {
             ino: 1,
@@ -47,7 +49,8 @@ impl fuser::Filesystem for Lis {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        println!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
+        debug!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
+        assert!(offset >= 0);
         if ino == 1 {
             if offset == 0 {
                 let _ = reply.add(1, 0, FileType::Directory, &Path::new("."));
