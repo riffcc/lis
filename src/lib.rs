@@ -20,6 +20,8 @@ use util::{get_paths_in_dir, key_from_file, key_to_string};
 mod cli;
 pub use cli::{Cli, Commands};
 
+mod fuse;
+
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
     pub manifest: Manifest,

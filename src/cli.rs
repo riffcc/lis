@@ -43,4 +43,6 @@ pub enum Commands {
     Join { ticket: NodeTicket },
     /// Generates a ticket for joining a network with Join
     Invite {},
+    /// Mounts path and keeps mounted while cli is running
+    Mount { mountpoint: PathBuf },
 }

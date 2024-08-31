@@ -2,6 +2,11 @@
 Life is short, but data should live forever
 
 ## Building
+First make sure you have `fuse3` dev installed:
+```bash
+sudo apt-get install fuse3 libfuse3-dev
+```
+Then build Lis:
 ```bash
 cargo build
 cp ./target/debug/lis ./lis

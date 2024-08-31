@@ -100,6 +100,9 @@ async fn main() -> Result<()> {
             println!("\n\n\tlis --root <some_root> join {ticket}\n");
             handle.await?;
         }
+        Commands::Mount { mountpoint } => {
+            fuser::mount2(lis, &mountpoint, &[])?;
+        }
     }
 
     Ok(())
