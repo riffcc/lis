@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Result};
+use std::{ffi::OsStr, fs, str::FromStr, sync::atomic::Ordering};
+
 use bytes::Bytes;
 use futures_lite::StreamExt;
 use iroh::{
@@ -7,9 +8,9 @@ use iroh::{
     net::ticket::NodeTicket,
     node::Node,
 };
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+
+pub mod prelude;
+use prelude::*;
 
 mod manifest;
 pub use manifest::Manifest;
@@ -22,11 +23,14 @@ pub use cli::{Cli, Commands};
 
 mod fuse;
 
+mod object;
+use object::Object;
+
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
     pub manifest: Manifest,
     files_doc: Doc,
-    root: PathBuf,
+    _root: PathBuf,
 }
 
 impl Lis {
@@ -46,44 +50,49 @@ impl Lis {
         fs::create_dir_all(root)?;
 
         let iroh_node = iroh::node::Node::persistent(root).await?.spawn().await?;
-
         // if manifest.json file found, load it
         // manifest.json holds data about the Files document (which points to all files)
         let manifest_path = root.join("manifest.json");
 
-        let (manifest, files_doc): (Manifest, Doc) = if manifest_path.exists() {
-            // load manifest
-            let file_content = fs::read_to_string(manifest_path)?;
-            let manifest: Manifest = serde_json::from_str(&file_content)?;
-            let files_doc = iroh_node
-                .docs()
-                .open(NamespaceId::from_str(manifest.files_doc_id.as_str())?)
-                .await?
-                .ok_or_else(|| anyhow!("no files doc found"))?;
+        let (manifest, files_doc) = match Manifest::load(&manifest_path)? {
+            Some(manifest) => {
+                let files_doc = iroh_node
+                    .docs()
+                    .open(NamespaceId::from_str(manifest.files_doc_id.as_str())?)
+                    .await?
+                    .ok_or_else(|| anyhow!("no files doc found"))?;
+                (manifest, files_doc)
+            }
+            None => {
+                // create new Files doc and manifest file
+                let files_doc = iroh_node.docs().create().await?;
+                let author = iroh_node.authors().create().await?;
+                iroh_node.authors().set_default(author).await?;
 
-            (manifest, files_doc)
-        } else {
-            // create new Files doc and manifest file
-            let files_doc = iroh_node.docs().create().await?;
-            let manifest = Manifest::new(files_doc.id().to_string());
+                let manifest = Manifest::new(manifest_path, files_doc.id().to_string())?;
 
-            // write to manifest.json file
-            let json_string = serde_json::to_string(&manifest)?;
-            fs::write(manifest_path, json_string)?;
+                manifest.save()?;
 
-            // create default author on the first time
-            let author = iroh_node.authors().create().await?;
-            iroh_node.authors().set_default(author).await?;
-            (manifest, files_doc)
+                (manifest, files_doc)
+            }
         };
 
         let lis = Lis {
             iroh_node,
             manifest,
             files_doc,
-            root: root.clone(),
+            _root: root.clone(),
         };
         Ok(lis)
+    }
+
+    /// Creates a new inode for use
+    pub fn next_ino(&mut self) -> Inode {
+        let ino = self.manifest.cur_ino.fetch_add(1, Ordering::SeqCst).into();
+        self.manifest
+            .save()
+            .expect("could not write to manifest file");
+        ino
     }
 
     /// List all files in node
@@ -117,9 +126,9 @@ impl Lis {
 
             let mut entries = Vec::new();
             for path in paths {
-                println!("adding {}", path.display());
                 entries.push(self.put_file(&path).await?);
             }
+            self.manifest.save()?;
 
             Ok(entries)
         }
@@ -145,7 +154,7 @@ impl Lis {
     /// Puts a file to a previously created document
     /// Returns the key to the added file upon success
     async fn put_file_to_doc(&mut self, path: &Path) -> Result<String> {
-        let key = key_from_file(&self.root, path)?;
+        let key = key_from_file(Path::new(""), path)?;
 
         // if key already in filesystem, remove it first
         let query = Query::key_exact(key.clone());
@@ -166,12 +175,23 @@ impl Lis {
             .collect::<Vec<_>>()
             .await;
 
-        key_to_string(key)
+        let str_key = key_to_string(key);
+        if let Ok(ref skey) = str_key {
+            let inode = self.next_ino();
+            let obj = Object::new(path, inode);
+            debug!("Adding {skey} (ino={inode})");
+            self.manifest.objects.insert(inode, obj?);
+            self.manifest
+                .inodes
+                .insert(PathBuf::from(skey.replace("\0", "")), inode);
+            self.manifest.save()?;
+        }
+        str_key
     }
 
     /// Remove a file
     pub async fn rm_file(&mut self, path: &Path) -> Result<String> {
-        let key = key_from_file(&self.root, path)?;
+        let key = key_from_file(Path::new(""), path)?;
 
         self.files_doc
             .del(self.iroh_node.authors().default().await?, key.clone())
@@ -181,7 +201,7 @@ impl Lis {
 
     /// Get contents of a file
     pub async fn get_file(&mut self, path: &Path) -> Result<Bytes> {
-        let key = key_from_file(&self.root, path)?;
+        let key = key_from_file(Path::new(""), path)?;
 
         // get content of the key from doc
         let query = Query::key_exact(key);
@@ -202,6 +222,16 @@ impl Lis {
     pub fn join(&mut self, ticket: &NodeTicket) -> Result<()> {
         let endpoint = self.iroh_node.endpoint();
         endpoint.add_node_addr(ticket.node_addr().clone())
+    }
+
+    fn get_full_name(&self, parent: Inode, name: &OsStr) -> Result<PathBuf> {
+        let name = PathBuf::from(name);
+        let parent_obj = self
+            .manifest
+            .objects
+            .get(&parent)
+            .ok_or(anyhow!("could not find parent's inode"))?;
+        Ok(parent_obj.path.join(name))
     }
 }
 

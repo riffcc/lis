@@ -1,8 +1,3 @@
-// use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyDirectory, Request, FUSE_ROOT_ID};
-use fuser::{FileAttr, FileType, ReplyAttr, ReplyDirectory, Request};
-use libc::ENOSYS;
-#[allow(unused)]
-use log::{debug, error, info, warn, LevelFilter};
 #[allow(unused)]
 use std::{
     ffi::OsStr,
@@ -11,32 +6,39 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::Lis;
+use crate::prelude::*;
+
+const BLOCK_SIZE: u64 = 512;
 
 impl fuser::Filesystem for Lis {
+    fn lookup(
+        &mut self,
+        _req: &Request<'_>,
+        parent: Inode,
+        name: &OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
+        debug!("lookup(parent={parent}, name={:#?})", name);
+        let full_name = self
+            .get_full_name(parent, name)
+            .expect("could not get full file name");
+        debug!("full_name={}", full_name.display());
+        debug!("inodes={:#?}", self.manifest.inodes);
+
+        if let Some(inode) = self.manifest.inodes.get(&full_name) {
+            if let Some(obj) = self.manifest.objects.get(inode) {
+                let ttl = Duration::new(1, 0);
+                reply.entry(&ttl, &obj.attr.clone().into(), 0);
+                return;
+            }
+        }
+        reply.error(ENOENT);
+    }
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         debug!("getattr(ino={ino})");
-        let ts = SystemTime::now();
-        let attr = FileAttr {
-            ino: 1,
-            size: 0,
-            blocks: 0,
-            atime: ts,
-            mtime: ts,
-            ctime: ts,
-            crtime: ts,
-            kind: FileType::Directory,
-            perm: 0o755,
-            nlink: 0,
-            uid: 0,
-            blksize: 512,
-            gid: 0,
-            rdev: 0,
-            flags: 0,
-        };
         let ttl = Duration::new(1, 0);
-        if ino == 1 {
-            reply.attr(&ttl, &attr);
+        if let Some(obj) = self.manifest.objects.get(&ino) {
+            reply.attr(&ttl, &obj.attr.clone().into());
         } else {
             reply.error(ENOSYS);
         }
@@ -51,7 +53,8 @@ impl fuser::Filesystem for Lis {
     ) {
         debug!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
         assert!(offset >= 0);
-        if ino == 1 {
+
+        if let Some(_obj) = self.manifest.objects.get(&ino) {
             if offset == 0 {
                 let _ = reply.add(1, 0, FileType::Directory, &Path::new("."));
                 let _ = reply.add(1, 1, FileType::Directory, &Path::new(".."));
@@ -77,6 +80,73 @@ impl fuser::Filesystem for Lis {
             reply.ok();
         } else {
             reply.error(ENOSYS);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum FileKind {
+    File,
+    Directory,
+    Symlink,
+}
+impl From<FileKind> for FileType {
+    fn from(kind: FileKind) -> Self {
+        match kind {
+            FileKind::File => fuser::FileType::RegularFile,
+            FileKind::Directory => fuser::FileType::Directory,
+            FileKind::Symlink => fuser::FileType::Symlink,
+        }
+    }
+}
+
+pub fn path_kind(path: &Path) -> Result<FileKind> {
+    if path.is_file() {
+        Ok(FileKind::File)
+    } else if path.is_dir() {
+        Ok(FileKind::Directory)
+    } else if path.is_symlink() {
+        Ok(FileKind::Symlink)
+    } else {
+        Err(anyhow!("unsupported path type"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InodeAttributes {
+    pub inode: Inode,
+    pub open_file_handles: u64, // Ref count of open file handles to this inode
+    pub size: u64,
+    pub last_accessed: SystemTime,
+    pub last_modified: SystemTime,
+    pub last_metadata_changed: SystemTime,
+    pub kind: FileKind,
+    // Permissions and special mode bits
+    pub mode: u16,
+    pub hardlinks: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl From<InodeAttributes> for fuser::FileAttr {
+    fn from(attrs: InodeAttributes) -> Self {
+        fuser::FileAttr {
+            ino: attrs.inode,
+            size: attrs.size,
+            blocks: (attrs.size + BLOCK_SIZE - 1) / BLOCK_SIZE,
+            atime: attrs.last_accessed,
+            mtime: attrs.last_modified,
+            ctime: attrs.last_metadata_changed,
+            crtime: SystemTime::UNIX_EPOCH,
+            kind: attrs.kind.into(),
+            perm: attrs.mode,
+            nlink: attrs.hardlinks,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            rdev: 0,
+            blksize: BLOCK_SIZE as u32,
+            flags: 0,
         }
     }
 }

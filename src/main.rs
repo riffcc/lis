@@ -17,10 +17,12 @@ async fn main() -> Result<()> {
         3 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
     };
-    env_logger::builder()
-        .format_timestamp_nanos()
-        .filter_level(log_level)
-        .init();
+
+    let mut log_builder = env_logger::builder();
+    log_builder.format_timestamp_nanos();
+    log_builder.filter(Some("lis"), log_level);
+    log_builder.filter(None, log::LevelFilter::Off);
+    log_builder.init();
 
     let mut lis = Lis::new(&cli.root, cli.overwrite).await?;
 
@@ -40,9 +42,7 @@ async fn main() -> Result<()> {
                 if let Ok(entry) = entry {
                     let key = entry.key();
                     let hash = entry.content_hash();
-                    // let author = entry.author();
-                    // let content = entry.content_bytes(self.iroh_node.client()).await?;
-                    info!("{} ({})", std::str::from_utf8(key)?, hash.fmt_short());
+                    println!("{} ({})", std::str::from_utf8(key)?, hash.fmt_short());
                 }
             }
         }
