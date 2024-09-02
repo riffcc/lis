@@ -26,6 +26,9 @@ mod fuse;
 mod object;
 use object::Object;
 
+mod directory;
+use directory::DirTree;
+
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
     pub manifest: Manifest,
@@ -93,6 +96,12 @@ impl Lis {
             .save()
             .expect("could not write to manifest file");
         ino
+    }
+
+    /// Returns the Doc struct if a path is a directory
+    pub fn path_to_doc(&self, path: &Path) -> Option<Doc> {
+        // TODO: implement
+        None
     }
 
     /// List all files in node
@@ -213,6 +222,12 @@ impl Lis {
 
         entry.content_bytes(self.iroh_node.client()).await
     }
+
+    /// Creates directory (if `recursive` is `true` create the full path)
+    pub async fn mkdir(path: &Path, recursive: bool) {
+        for doc in self.doc_from_path(create_dir)
+    }
+
     /// Generate a NodeTicket invite
     pub async fn invite(&self) -> Result<NodeTicket> {
         let node_addr = self.iroh_node.net().node_addr().await?;

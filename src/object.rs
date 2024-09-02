@@ -9,6 +9,7 @@ use crate::prelude::*;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
+    /// Absolute path to object
     pub path: PathBuf,
     pub attr: InodeAttributes,
 }
