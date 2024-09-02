@@ -13,22 +13,32 @@ cp ./target/debug/lis ./lis
 ```
 
 ## Usage
-**Obs:** you can use `cargo run -- --root ...` instead of `lis` if you want to build and run every time (.e.g. when developing or testing changes).
+**Obs:** you can use `cargo run -- /path/to/root ...` instead of `lis` if you want to build and run every time (.e.g. when developing or testing changes).
 
 Put a file in the node at `/path/to/node/directory`
 ```bash
-lis --root /path/to/node/directory put ./my_file.txt
+lis /path/to/root put ./my_file.txt
 ```
 
 List files in the node at `/path/to/node/directory`
 ```bash
-lis --root /path/to/node/directory ls
+lis /path/to/root list
+```
+
+Mount FUSE filesystem (readonly)
+```bash
+# will hang, leave it running
+lis /path/to/root mount /path/to/mountpoint
+
+# in another terminal
+ls /path/to/mountpoint
+cat /path/to/mountpoint/a-file.txt
 ```
 
 Get contents of `README.md` file in the node at `/path/to/node/directory`
 ```bash
-lis --root /path/to/node/directory put README.md
-lis --root /path/to/node/directory get README.md
+lis /path/to/root put README.md
+lis /path/to/root get README.md
 ```
 
 
