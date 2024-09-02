@@ -241,8 +241,7 @@ mod tests {
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
 
-    async fn setup_lis() -> Lis {
-        let tmp_dir = TempDir::new().expect("Could not create temp dir");
+    async fn setup_lis(tmp_dir: &TempDir) -> Lis {
         let root = PathBuf::from(tmp_dir.path());
         let overwrite = true;
         Lis::new(&root, overwrite)
@@ -252,7 +251,8 @@ mod tests {
 
     #[tokio::test]
     async fn put_dir() {
-        let mut lis = setup_lis().await;
+        let tmp_dir = TempDir::new().expect("Could not create temp dir");
+        let mut lis = setup_lis(&tmp_dir).await;
 
         let tmp_dir = TempDir::new().expect("Could not create temp dir");
         let file_path = tmp_dir.path();
@@ -267,7 +267,8 @@ mod tests {
 
     #[tokio::test]
     async fn double_put() {
-        let mut lis = setup_lis().await;
+        let tmp_dir = TempDir::new().expect("Could not create temp dir");
+        let mut lis = setup_lis(&tmp_dir).await;
 
         // Create a file inside of `env::temp_dir()`.
         let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
@@ -292,7 +293,8 @@ mod tests {
 
     #[tokio::test]
     async fn put_file() {
-        let mut lis = setup_lis().await;
+        let tmp_dir = TempDir::new().expect("Could not create temp dir");
+        let mut lis = setup_lis(&tmp_dir).await;
 
         // Create a file inside of `env::temp_dir()`.
         let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
