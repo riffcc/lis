@@ -58,8 +58,6 @@ impl fuser::Filesystem for Lis {
             if offset == 0 {
                 let _ = reply.add(1, 0, FileType::Directory, &Path::new("."));
                 let _ = reply.add(1, 1, FileType::Directory, &Path::new(".."));
-                let handle = tokio::runtime::Handle::current();
-                let _guard = handle.enter();
                 let entries = futures::executor::block_on(self.list()).expect("could not list dir");
                 for (index, entry) in entries.into_iter().enumerate() {
                     if let Ok(entry) = entry {
