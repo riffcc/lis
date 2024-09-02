@@ -2,7 +2,13 @@ use anyhow::Result;
 use clap::Parser;
 #[allow(unused)]
 use log::{debug, error, info, warn, LevelFilter};
-use std::io::Write;
+use std::{
+    io::Write,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use lis::{Cli, Commands, Lis, Manifest};
 
@@ -116,7 +122,16 @@ async fn main() -> Result<()> {
             handle.await?;
         }
         Commands::Mount { mountpoint } => {
-            fuser::mount2(lis, &mountpoint, &[])?;
+            let _handle = fuser::spawn_mount2(lis, &mountpoint, &[])?;
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let stop_clone = stop.clone();
+            let mountpoint_clone = mountpoint.clone();
+            ctrlc::set_handler(move || {
+                println!("unmounting {}", mountpoint_clone.display());
+                stop_clone.store(true, Ordering::SeqCst);
+            })?;
+            while !stop.load(Ordering::SeqCst) {}
         }
     }
 

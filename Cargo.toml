@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1.0.86"
 bytes = "1.7.1"
 clap = { version = "4.5.13", features = ["derive"] }
+ctrlc = "3.4.5"
 env_logger = "0.11.5"
 fuser = "0.14.0"
 futures = "0.3.30"

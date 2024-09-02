@@ -4,17 +4,17 @@ use clap::{ArgAction, Parser, Subcommand};
 use iroh::net::ticket::NodeTicket;
 
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(name = "lis", version, about, long_about = None)]
 pub struct Cli {
-    /// If Iroh node is on disk set root dir (otherwise it's in memory)
-    #[arg(long, value_parser)]
+    /// Root dir for lis
+    #[arg(required = true, value_parser)]
     pub root: PathBuf,
 
     #[arg(short, long)]
     pub overwrite: bool,
 
     /// Verbose mode (-v, -vv, -vvv, -vvvv)
-    #[arg(short, long, action = ArgAction::Count)]
+    #[arg(short, action = ArgAction::Count)]
     pub verbosity: u8,
 
     // /// Sets a custom config file
