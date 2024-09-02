@@ -82,6 +82,44 @@ impl fuser::Filesystem for Lis {
             reply.error(ENOSYS);
         }
     }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        inode: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
+        debug!(
+            "read() called on {:?} offset={:?} size={:?}",
+            inode, offset, size
+        );
+        assert!(offset >= 0);
+
+        // TODO: check read access
+        // if !self.check_file_handle_read(fh) {
+        //     reply.error(libc::EACCES);
+        //     return;
+        // }
+
+        let path = match self.manifest.objects.get(&inode) {
+            Some(obj) => obj.path.clone(),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if let Ok(bytes_content) = futures::executor::block_on(self.get_file(&path)) {
+            let buffer: Vec<u8> = bytes_content.to_vec();
+            reply.data(&buffer);
+            return;
+        }
+        reply.error(libc::ENOENT);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
