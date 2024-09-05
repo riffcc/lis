@@ -277,7 +277,6 @@ mod tests {
         let tmp_dir = TempDir::new().expect("Could not create temp dir");
         let mut lis = setup_lis(&tmp_dir).await;
 
-        let tmp_dir = TempDir::new().expect("Could not create temp dir");
         let file_path = tmp_dir.path();
         let mut file = NamedTempFile::new_in(file_path).expect("Could not create named temp file");
         let content = "Brian was here. Briefly.";
