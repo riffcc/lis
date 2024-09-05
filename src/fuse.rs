@@ -19,20 +19,19 @@ impl fuser::Filesystem for Lis {
         reply: fuser::ReplyEntry,
     ) {
         debug!("lookup(parent={parent}, name={:#?})", name);
-        let full_name = self
-            .get_full_name(parent, name)
+        let full_path = self
+            .get_full_path(parent, name)
             .expect("could not get full file name");
-        debug!("full_name={}", full_name.display());
-        debug!("inodes={:#?}", self.manifest.inodes);
 
-        if let Some(inode) = self.manifest.inodes.get(&full_name) {
-            if let Some(obj) = self.manifest.objects.get(inode) {
+        match self.obj_from_path(&full_path) {
+            Some(obj) => {
                 let ttl = Duration::new(1, 0);
                 reply.entry(&ttl, &obj.attr.clone().into(), 0);
-                return;
+            }
+            None => {
+                reply.error(ENOENT);
             }
         }
-        reply.error(ENOENT);
     }
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         debug!("getattr(ino={ino})");
@@ -54,31 +53,42 @@ impl fuser::Filesystem for Lis {
         debug!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
         assert!(offset >= 0);
 
+        if offset != 0 {
+            reply.ok();
+            return;
+        }
+
         if let Some(_obj) = self.manifest.objects.get(&ino) {
-            if offset == 0 {
-                let _ = reply.add(1, 0, FileType::Directory, &Path::new("."));
-                let _ = reply.add(1, 1, FileType::Directory, &Path::new(".."));
-                let entries = futures::executor::block_on(self.list()).expect("could not list dir");
-                for (index, entry) in entries.into_iter().enumerate() {
-                    if let Ok(entry) = entry {
-                        let key = std::str::from_utf8(entry.key())
-                            .expect("Could not go from key to utf8")
-                            .replace("\0", "");
-                        let path = PathBuf::from(key);
-                        let filename = path.file_name().expect("Could not get filename");
-                        let _ = reply.add(
-                            index as u64 + 2,
-                            offset + index as i64 + 1,
-                            FileType::RegularFile,
-                            &Path::new(filename),
-                        );
+            let _ = reply.add(1, 0, FileType::Directory, &Path::new("."));
+            let _ = reply.add(1, 1, FileType::Directory, &Path::new(".."));
+            let entries = futures::executor::block_on(self.list()).expect("could not list dir");
+            for (index, entry) in entries.into_iter().enumerate() {
+                if let Ok(entry) = entry {
+                    let key = std::str::from_utf8(entry.key())
+                        .expect("Could not go from key to utf8")
+                        .replace("\0", "");
+                    let path = PathBuf::from(key);
+                    let name = path.file_name().expect("could not get file or dir name");
+                    match self.obj_from_path(&path.as_path()) {
+                        Some(obj) => {
+                            let _ = reply.add(
+                                index as u64 + 2,
+                                offset + index as i64 + 1,
+                                obj.attr.kind.into(),
+                                &Path::new(name),
+                            );
+                        }
+                        None => {
+                            reply.error(ENOSYS);
+                            return;
+                        }
                     }
                 }
             }
             reply.ok();
-        } else {
-            reply.error(ENOSYS);
+            return;
         }
+        reply.error(ENOSYS);
     }
 
     fn read(

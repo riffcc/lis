@@ -57,13 +57,13 @@ async fn main() -> Result<()> {
                 let content = lis.get_file(path.as_path()).await?;
                 // Convert to &str
                 let ascii_content = std::str::from_utf8(&content)?;
-                info!("{}\n\n{}", path.display(), ascii_content);
+                println!("{}\n\n{}", path.display(), ascii_content);
             }
         }
         Commands::Rm { paths } => {
             for path in paths {
                 let key = lis.rm_file(path.as_path()).await?;
-                info!("Removed {key}");
+                println!("Removed {key}");
             }
         }
         Commands::Join { ticket } => {

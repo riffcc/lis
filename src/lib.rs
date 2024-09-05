@@ -117,6 +117,14 @@ impl Lis {
         Ok(entries)
     }
 
+    pub fn obj_from_path(&self, path: &Path) -> Option<&Object> {
+        if let Some(ino) = self.manifest.inodes.get(path) {
+            self.manifest.objects.get(&ino)
+        } else {
+            None
+        }
+    }
+
     /// Adds files and directories to Lis
     /// Returns `(path, key)` pairs of the added file upon success
     pub async fn put(&mut self, src_path: &Path) -> Result<Vec<(PathBuf, String)>> {
@@ -239,7 +247,7 @@ impl Lis {
         endpoint.add_node_addr(ticket.node_addr().clone())
     }
 
-    fn get_full_name(&self, parent: Inode, name: &OsStr) -> Result<PathBuf> {
+    fn get_full_path(&self, parent: Inode, name: &OsStr) -> Result<PathBuf> {
         let name = PathBuf::from(name);
         let parent_obj = self
             .manifest

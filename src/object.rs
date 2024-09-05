@@ -26,7 +26,7 @@ impl Object {
             last_modified: ts,
             last_metadata_changed: ts,
             kind: path_kind(path)?.into(),
-            mode: 0o755,
+            mode: 0o444, // read-only TODO: change once it's read/write
             hardlinks: 1,
             uid: 0,
             gid: 0,
