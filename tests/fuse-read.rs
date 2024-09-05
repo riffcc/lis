@@ -43,7 +43,7 @@ async fn test_readdir_empty() {
 }
 
 #[tokio::test]
-async fn test_readdir_files() {
+async fn test_readdir_non_empty() {
     // Setup Lis
     let tmp_root = TempDir::new().expect("Could not create temp dir");
     let mut lis = setup_lis(&tmp_root).await;
@@ -78,4 +78,27 @@ async fn test_readdir_files() {
     for entry in entries {
         assert!(entry.metadata().unwrap().permissions().readonly());
     }
+}
+
+#[tokio::test]
+async fn test_read() {
+    // Setup Lis
+    let tmp_root = TempDir::new().expect("Could not create temp dir");
+    let mut lis = setup_lis(&tmp_root).await;
+
+    // Add file to lis
+    // Create a file inside of `env::temp_dir()`.
+    let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
+    let content = "Brian was here. Briefly.";
+    write!(file, "{}", content).expect("Could not write to named temp file");
+    lis.put(file.path()).await.expect("Could not put file");
+
+    // Mount Lis
+    let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");
+    let _handle = fuser::spawn_mount2(lis, &tmp_mountpoint, &[]).expect("could not mount Lis");
+
+    // Read added file
+    let contents = fs::read_to_string(file.path()).expect("Should have been able to read the file");
+
+    assert_eq!(contents, "Brian was here. Briefly.");
 }
