@@ -9,7 +9,7 @@ use crate::{object::Object, prelude::*};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     manifest_path: PathBuf,
-    pub files_doc_id: String, // doc hash for Files document
+    pub root_doc_id: String, // doc hash for root document
     /// Maps inodes to objects
     pub objects: BTreeMap<Inode, Object>, // inode -> object
     /// Maps object keys to inodes
@@ -30,7 +30,7 @@ impl Manifest {
 
         Ok(Manifest {
             manifest_path,
-            files_doc_id: doc_id,
+            root_doc_id: doc_id,
             objects,
             inodes,
             cur_ino,

@@ -42,6 +42,13 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Commands::Mkdir { path } => {
+            info!(
+                "Created {} (id: {:#?})",
+                path.display(),
+                lis.mkdir(path).await?
+            );
+        }
         Commands::List {} => {
             let entries = lis.list().await?;
             for entry in entries {

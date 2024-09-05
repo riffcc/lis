@@ -27,12 +27,12 @@ mod object;
 use object::Object;
 
 mod directory;
-use directory::DirTree;
+use directory::Directory;
 
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
     pub manifest: Manifest,
-    files_doc: Doc,
+    root_doc: Doc,
     _root: PathBuf,
 }
 
@@ -57,33 +57,33 @@ impl Lis {
         // manifest.json holds data about the Files document (which points to all files)
         let manifest_path = root.join("manifest.json");
 
-        let (manifest, files_doc) = match Manifest::load(&manifest_path)? {
+        let (manifest, root_doc) = match Manifest::load(&manifest_path)? {
             Some(manifest) => {
-                let files_doc = iroh_node
+                let root_doc = iroh_node
                     .docs()
-                    .open(NamespaceId::from_str(manifest.files_doc_id.as_str())?)
+                    .open(NamespaceId::from_str(manifest.root_doc_id.as_str())?)
                     .await?
                     .ok_or_else(|| anyhow!("no files doc found"))?;
-                (manifest, files_doc)
+                (manifest, root_doc)
             }
             None => {
                 // create new Files doc and manifest file
-                let files_doc = iroh_node.docs().create().await?;
+                let root_doc = iroh_node.docs().create().await?;
                 let author = iroh_node.authors().create().await?;
                 iroh_node.authors().set_default(author).await?;
 
-                let manifest = Manifest::new(manifest_path, files_doc.id().to_string())?;
+                let manifest = Manifest::new(manifest_path, root_doc.id().to_string())?;
 
                 manifest.save()?;
 
-                (manifest, files_doc)
+                (manifest, root_doc)
             }
         };
 
         let lis = Lis {
             iroh_node,
             manifest,
-            files_doc,
+            root_doc,
             _root: root.clone(),
         };
         Ok(lis)
@@ -108,7 +108,7 @@ impl Lis {
     pub async fn list(&self) -> Result<Vec<Result<Entry>>> {
         let query = Query::all().build();
         let entries = self
-            .files_doc
+            .root_doc
             .get_many(query)
             .await?
             .collect::<Vec<_>>()
@@ -175,13 +175,13 @@ impl Lis {
 
         // if key already in filesystem, remove it first
         let query = Query::key_exact(key.clone());
-        if self.files_doc.get_one(query).await?.is_some() {
-            self.files_doc
+        if self.root_doc.get_one(query).await?.is_some() {
+            self.root_doc
                 .del(self.iroh_node.authors().default().await?, key.clone())
                 .await?; // delete old entry
         }
 
-        self.files_doc
+        self.root_doc
             .import_file(
                 self.iroh_node.authors().default().await?,
                 key.clone(),
@@ -210,7 +210,7 @@ impl Lis {
     pub async fn rm_file(&mut self, path: &Path) -> Result<String> {
         let key = key_from_file(Path::new(""), path)?;
 
-        self.files_doc
+        self.root_doc
             .del(self.iroh_node.authors().default().await?, key.clone())
             .await?;
         key_to_string(key)
@@ -223,17 +223,12 @@ impl Lis {
         // get content of the key from doc
         let query = Query::key_exact(key);
         let entry = self
-            .files_doc
+            .root_doc
             .get_one(query)
             .await?
             .ok_or_else(|| anyhow!("entry not found"))?;
 
         entry.content_bytes(self.iroh_node.client()).await
-    }
-
-    /// Creates directory (if `recursive` is `true` create the full path)
-    pub async fn mkdir(path: &Path, recursive: bool) {
-        for doc in self.doc_from_path(create_dir)
     }
 
     /// Generate a NodeTicket invite
@@ -255,6 +250,36 @@ impl Lis {
             .get(&parent)
             .ok_or(anyhow!("could not find parent's inode"))?;
         Ok(parent_obj.path.join(name))
+    }
+    pub async fn mkdir(&self, full_path: &PathBuf) -> Result<NamespaceId> {
+        let mut path = full_path.clone();
+
+        if path.starts_with("/") {
+            path = path.strip_prefix("/")?.to_path_buf();
+        }
+
+        let doc = &self.root_doc;
+
+        let mut iter = path.iter().peekable();
+        // iterate until second to last dir
+        while let Some(dir) = iter.next() {
+            // if there is a next item
+            if iter.peek().is_some() {
+                //  if dir not in doc
+                //      return error
+                //  else
+                //      doc = new_doc
+                println!("{}", item);
+            } else {
+                // break if next is the last item
+                break;
+            }
+        }
+
+        // if next (last) dir does not exist
+        //      create new doc
+        // return Ok(doc.id())
+        Ok(doc.id())
     }
 }
 

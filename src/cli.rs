@@ -33,6 +33,8 @@ pub enum Commands {
     /// Puts files into node
     /// Paths that don't exist or aren't accessible are ignored
     Put { paths: Vec<PathBuf> },
+    /// Creates new top-level directory (e.g. `/foo` or `/bar`)
+    Mkdir { path: PathBuf },
     /// List files on filesystem
     /// Paths that don't exist or aren't accessible are ignored
     #[command(alias = "ls")]
