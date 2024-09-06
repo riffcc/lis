@@ -4,7 +4,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::fuse::{path_kind, InodeAttributes};
+use crate::fuse::{FileKind, InodeAttributes};
 use crate::prelude::*;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15,9 +15,13 @@ pub struct Object {
 }
 
 impl Object {
-    pub fn new(path: &Path, inode: u64) -> Result<Self> {
+    pub fn new(path: &Path, inode: u64, kind: FileKind) -> Result<Self> {
         let ts = SystemTime::now();
-        let size = fs::metadata(path)?.len();
+        let size = match kind {
+            FileKind::File => fs::metadata(path)?.len(),
+            FileKind::Directory => 0,
+            FileKind::Symlink => unimplemented!(),
+        };
         let attr = InodeAttributes {
             inode,
             open_file_handles: 0,
@@ -25,7 +29,7 @@ impl Object {
             last_accessed: ts,
             last_modified: ts,
             last_metadata_changed: ts,
-            kind: path_kind(path)?.into(),
+            kind: kind.into(),
             mode: 0o444, // read-only TODO: change once it's read/write
             hardlinks: 1,
             uid: 0,

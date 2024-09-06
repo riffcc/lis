@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::{object::Object, prelude::*};
+use crate::{fuse::FileKind, object::Object, prelude::*};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
@@ -20,7 +20,11 @@ pub struct Manifest {
 impl Manifest {
     pub fn new(manifest_path: PathBuf, doc_id: String) -> Result<Self> {
         let cur_ino = AtomicU64::new(1);
-        let root_obj = Object::new(Path::new("/"), cur_ino.fetch_add(1, Ordering::SeqCst))?;
+        let root_obj = Object::new(
+            Path::new("/"),
+            cur_ino.fetch_add(1, Ordering::SeqCst),
+            FileKind::Directory,
+        )?;
 
         let mut objects = BTreeMap::new();
         let mut inodes = BTreeMap::new();

@@ -16,18 +16,19 @@ mod manifest;
 pub use manifest::Manifest;
 
 mod util;
-use util::{get_paths_in_dir, key_from_file, key_to_string};
+use util::*;
 
 mod cli;
 pub use cli::{Cli, Commands};
 
 mod fuse;
+use fuse::FileKind;
 
 mod object;
 use object::Object;
 
-mod directory;
-use directory::Directory;
+// mod directory;
+// use directory::Directory;
 
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
@@ -96,12 +97,6 @@ impl Lis {
             .save()
             .expect("could not write to manifest file");
         ino
-    }
-
-    /// Returns the Doc struct if a path is a directory
-    pub fn path_to_doc(&self, path: &Path) -> Option<Doc> {
-        // TODO: implement
-        None
     }
 
     /// List all files in node
@@ -192,12 +187,18 @@ impl Lis {
             .collect::<Vec<_>>()
             .await;
 
+        // add file obj to filesystem
+        self.create_fs_objects(path, FileKind::File)
+    }
+
+    fn create_fs_objects(&mut self, path: &Path, kind: FileKind) -> Result<String> {
+        let key = key_from_file(Path::new(""), path)?;
         let str_key = key_to_string(key);
         if let Ok(ref skey) = str_key {
             let inode = self.next_ino();
-            let obj = Object::new(path, inode);
+            let obj = Object::new(path, inode, kind)?;
             debug!("Adding {skey} (ino={inode})");
-            self.manifest.objects.insert(inode, obj?);
+            self.manifest.objects.insert(inode, obj);
             self.manifest
                 .inodes
                 .insert(PathBuf::from(skey.replace("\0", "")), inode);
@@ -251,35 +252,77 @@ impl Lis {
             .ok_or(anyhow!("could not find parent's inode"))?;
         Ok(parent_obj.path.join(name))
     }
-    pub async fn mkdir(&self, full_path: &PathBuf) -> Result<NamespaceId> {
+
+    /// Create directory if doesn't already exist
+    pub async fn mkdir(&mut self, full_path: &PathBuf) -> Result<NamespaceId> {
         let mut path = full_path.clone();
 
         if path.starts_with("/") {
             path = path.strip_prefix("/")?.to_path_buf();
         }
 
-        let doc = &self.root_doc;
+        let mut doc = self.root_doc.clone();
 
+        // iterate until last dir
         let mut iter = path.iter().peekable();
-        // iterate until second to last dir
         while let Some(dir) = iter.next() {
-            // if there is a next item
-            if iter.peek().is_some() {
-                //  if dir not in doc
-                //      return error
-                //  else
-                //      doc = new_doc
-                println!("{}", item);
-            } else {
-                // break if next is the last item
+            if iter.peek().is_none() {
+                // create new doc if this is the last item
+                doc = self.create_doc(&doc, Path::new(dir)).await?;
                 break;
             }
+            doc = match self.next_doc(&doc, Path::new(dir)).await? {
+                Some(next_doc) => next_doc,
+                None => {
+                    return Err(anyhow!(
+                        "could not find {} in tree",
+                        Path::new(dir).display()
+                    ))
+                }
+            };
         }
 
-        // if next (last) dir does not exist
-        //      create new doc
-        // return Ok(doc.id())
         Ok(doc.id())
+    }
+
+    /// Gets next doc from base_doc and key
+    async fn next_doc(&self, base_doc: &Doc, next_key: &Path) -> Result<Option<Doc>> {
+        let key = key_from_file(Path::new(""), next_key)?;
+        let query = Query::key_exact(key.clone());
+        let next_doc_id = match base_doc.get_one(query).await? {
+            Some(entry) => entry.content_bytes(base_doc).await?,
+            None => return Ok(None),
+        };
+
+        Ok(self
+            .iroh_node
+            .docs()
+            .open(bytes_to_namespaceid(next_doc_id)?)
+            .await?)
+    }
+    /// Creates new Doc with name `next_key` and `base_doc` as its parent
+    async fn create_doc(&mut self, base_doc: &Doc, dir_name: &Path) -> Result<Doc> {
+        // check if key already exists
+        let key = key_from_file(Path::new(""), dir_name)?;
+        let query = Query::key_exact(key.clone());
+        if let Some(_doc_id) = base_doc.get_one(query).await? {
+            return Err(anyhow!(
+                "cannot create directory {}, already exists",
+                dir_name.display()
+            ));
+        }
+
+        // Doc doesn't already exist, create new Doc
+        let new_doc = self.iroh_node.docs().create().await?;
+        let author = self.iroh_node.authors().default().await?;
+        base_doc
+            .set_bytes(author, key, namespaceid_to_bytes(new_doc.id()))
+            .await?;
+
+        self.create_fs_objects(dir_name, FileKind::Directory)?;
+        debug!("Created directory {}", dir_name.display());
+
+        Ok(new_doc)
     }
 }
 

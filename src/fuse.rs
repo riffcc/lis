@@ -146,6 +146,7 @@ impl From<FileKind> for FileType {
     }
 }
 
+#[allow(unused)]
 pub fn path_kind(path: &Path) -> Result<FileKind> {
     if path.is_file() {
         Ok(FileKind::File)
