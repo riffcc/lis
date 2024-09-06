@@ -100,14 +100,29 @@ impl Lis {
     }
 
     /// List all files in node
-    pub async fn list(&self) -> Result<Vec<Result<Entry>>> {
+    pub async fn list(&self, full_path: &Path) -> Result<Vec<Result<Entry>>> {
+        let mut doc = self.root_doc.clone();
+
+        let mut path = full_path;
+
+        if path.starts_with("/") {
+            path = path.strip_prefix("/")?;
+        }
+        // iterate until last dir
+        for dir in path.iter() {
+            doc = match self.next_doc(&doc, Path::new(dir)).await? {
+                Some(next_doc) => next_doc,
+                None => {
+                    return Err(anyhow!(
+                        "could not find {} in tree",
+                        Path::new(dir).display()
+                    ))
+                }
+            };
+        }
+
         let query = Query::all().build();
-        let entries = self
-            .root_doc
-            .get_many(query)
-            .await?
-            .collect::<Vec<_>>()
-            .await;
+        let entries = doc.get_many(query).await?.collect::<Vec<_>>().await;
 
         Ok(entries)
     }
@@ -375,7 +390,7 @@ mod tests {
 
         let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
 
-        let files = lis.list().await.expect("Could not get file"); // should succeed
+        let files = lis.list(Path::new("/")).await.expect("Could not get file"); // should succeed
 
         assert_eq!(get_content, "Brian was here. Briefly. more"); // new content should be there
         assert_eq!(files.len(), 1); // there should only be one file
@@ -401,7 +416,7 @@ mod tests {
 
         let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
 
-        let files = lis.list().await.expect("Could not get file"); // should succeed
+        let files = lis.list(Path::new("/")).await.expect("Could not get file"); // should succeed
 
         assert_eq!(get_content, "Brian was here. Briefly. more"); // new content should be there
         assert_eq!(files.len(), 1); // there should only be one file

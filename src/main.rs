@@ -4,6 +4,7 @@ use clap::Parser;
 use log::{debug, error, info, warn, LevelFilter};
 use std::{
     io::Write,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -49,8 +50,11 @@ async fn main() -> Result<()> {
                 lis.mkdir(path).await?
             );
         }
-        Commands::List {} => {
-            let entries = lis.list().await?;
+        Commands::List { path } => {
+            let entries = match path {
+                Some(path) => lis.list(path).await?,
+                None => lis.list(Path::new("/")).await?,
+            };
             for entry in entries {
                 if let Ok(entry) = entry {
                     let key = entry.key();

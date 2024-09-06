@@ -38,7 +38,7 @@ pub enum Commands {
     /// List files on filesystem
     /// Paths that don't exist or aren't accessible are ignored
     #[command(alias = "ls")]
-    List {},
+    List { path: Option<PathBuf> },
     /// Gets files that are not currently locally accessible
     /// Paths that don't exist or aren't accessible are ignored
     Get { paths: Vec<PathBuf> },

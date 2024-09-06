@@ -58,10 +58,11 @@ impl fuser::Filesystem for Lis {
             return;
         }
 
-        if let Some(_obj) = self.manifest.objects.get(&ino) {
+        if let Some(obj) = self.manifest.objects.get(&ino) {
             let _ = reply.add(1, 0, FileType::Directory, &Path::new("."));
             let _ = reply.add(1, 1, FileType::Directory, &Path::new(".."));
-            let entries = futures::executor::block_on(self.list()).expect("could not list dir");
+            let entries =
+                futures::executor::block_on(self.list(&obj.path)).expect("could not list dir");
             for (index, entry) in entries.into_iter().enumerate() {
                 if let Ok(entry) = entry {
                     let key = std::str::from_utf8(entry.key())
