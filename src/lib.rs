@@ -22,7 +22,7 @@ mod cli;
 pub use cli::{Cli, Commands};
 
 mod fuse;
-use fuse::FileKind;
+use fuse::{FileKind, InodeAttributes};
 
 mod object;
 use object::Object;
@@ -33,6 +33,7 @@ use object::Object;
 pub struct Lis {
     pub iroh_node: Node<iroh::blobs::store::fs::Store>,
     pub manifest: Manifest,
+    pub rt: tokio::runtime::Handle,
     root_doc: Doc,
     _root: PathBuf,
 }
@@ -84,6 +85,7 @@ impl Lis {
         let lis = Lis {
             iroh_node,
             manifest,
+            rt: tokio::runtime::Handle::current(),
             root_doc,
             _root: root.clone(),
         };
@@ -101,14 +103,14 @@ impl Lis {
 
     /// List all files in node
     pub async fn list(&self, full_path: &Path) -> Result<Vec<Result<Entry>>> {
-        let mut doc = self.root_doc.clone();
-
         let mut path = full_path;
 
         if path.starts_with("/") {
             path = path.strip_prefix("/")?;
         }
+
         // iterate until last dir
+        let mut doc = self.root_doc.clone();
         for dir in path.iter() {
             doc = match self.next_doc(&doc, Path::new(dir)).await? {
                 Some(next_doc) => next_doc,
@@ -127,99 +129,107 @@ impl Lis {
         Ok(entries)
     }
 
-    pub fn obj_from_path(&self, path: &Path) -> Option<&Object> {
-        if let Some(ino) = self.manifest.inodes.get(path) {
-            self.manifest.objects.get(&ino)
-        } else {
-            None
+    pub fn obj_from_path(&self, full_path: &Path) -> Option<&Object> {
+        let ino = self.manifest.inodes.get(full_path)?;
+        self.manifest.objects.get(&ino)
+    }
+
+    pub fn write_inode(&mut self, attr: &InodeAttributes) -> Result<()> {
+        let ino: Inode = attr.inode;
+        match self.manifest.objects.get_mut(&ino) {
+            Some(obj) => {
+                obj.attr = attr.clone();
+                self.manifest.save()
+            }
+            None => Err(anyhow!("could not find object for inode {ino}")),
         }
     }
 
     /// Adds files and directories to Lis
     /// Returns `(path, key)` pairs of the added file upon success
-    pub async fn put(&mut self, src_path: &Path) -> Result<Vec<(PathBuf, String)>> {
+    pub async fn put(
+        &mut self,
+        src_path: &Path,
+        dst_path: &Path,
+    ) -> Result<Vec<(PathBuf, String)>> {
         if !src_path.exists() {
             return Err(anyhow!("Path {} does not exist", src_path.display()));
         }
 
         let full_src_path = fs::canonicalize(&src_path)?;
-        if src_path.is_file() {
-            Ok(vec![(
-                src_path.to_path_buf(),
-                self.put_file_to_doc(full_src_path.as_path()).await?,
-            )])
-        } else {
-            let paths = get_paths_in_dir(&full_src_path)?;
-
-            let mut entries = Vec::new();
-            for path in paths {
-                entries.push(self.put_file(&path).await?);
-            }
-            self.manifest.save()?;
-
-            Ok(entries)
+        if !full_src_path.is_file() {
+            return Err(anyhow!("{} is not a file", full_src_path.display()));
         }
-    }
+        let full_dst_path = add_leading_slash(dst_path);
 
-    /// Creates a new Doc and adds a file to it
-    /// Returns a `(path, key)` pair of the added file upon success
-    async fn put_file(&mut self, src_path: &Path) -> Result<(PathBuf, String)> {
-        if !src_path.exists() {
-            return Err(anyhow!("File {} not found", src_path.display()));
-        }
-        if !src_path.is_file() {
-            return Err(anyhow!("Path must be a file"));
-        }
+        let doc = self
+            .find_dir_doc(
+                &dst_path
+                    .parent()
+                    .ok_or(anyhow!("Could not find Doc for parent dir"))?
+                    .to_path_buf(),
+            )
+            .await?;
 
-        let full_src_path = fs::canonicalize(&src_path)?;
-        Ok((
+        self.put_file_to_doc(&doc, full_src_path.as_path(), &full_dst_path)
+            .await?;
+
+        // add file obj to filesystem
+        let size = fs::metadata(src_path)?.len();
+        self.create_fs_objects(&full_dst_path, FileKind::File, Some(size), None, None, None)?;
+
+        Ok(vec![(
             src_path.to_path_buf(),
-            self.put_file_to_doc(full_src_path.as_path()).await?,
-        ))
+            full_dst_path.to_string_lossy().to_string(),
+        )])
     }
 
     /// Puts a file to a previously created document
     /// Returns the key to the added file upon success
-    async fn put_file_to_doc(&mut self, path: &Path) -> Result<String> {
-        let key = key_from_file(Path::new(""), path)?;
+    async fn put_file_to_doc(
+        &mut self,
+        doc: &Doc,
+        import_path: &Path,
+        dst_path: &Path,
+    ) -> Result<()> {
+        let key = key_from_file(Path::new(""), dst_path)?;
+
+        let default_author = self.iroh_node.authors().default().await?;
 
         // if key already in filesystem, remove it first
         let query = Query::key_exact(key.clone());
-        if self.root_doc.get_one(query).await?.is_some() {
-            self.root_doc
-                .del(self.iroh_node.authors().default().await?, key.clone())
-                .await?; // delete old entry
+        if doc.get_one(query).await?.is_some() {
+            doc.del(default_author, key.clone()).await?; // delete old entry
         }
 
-        self.root_doc
-            .import_file(
-                self.iroh_node.authors().default().await?,
-                key.clone(),
-                path,
-                false,
-            )
+        doc.import_file(default_author, key.clone(), import_path, false)
             .await?
             .collect::<Vec<_>>()
             .await;
 
-        // add file obj to filesystem
-        self.create_fs_objects(path, FileKind::File)
+        Ok(())
     }
 
-    fn create_fs_objects(&mut self, path: &Path, kind: FileKind) -> Result<String> {
-        let key = key_from_file(Path::new(""), path)?;
-        let str_key = key_to_string(key);
-        if let Ok(ref skey) = str_key {
-            let inode = self.next_ino();
-            let obj = Object::new(path, inode, kind)?;
-            debug!("Adding {skey} (ino={inode})");
-            self.manifest.objects.insert(inode, obj);
-            self.manifest
-                .inodes
-                .insert(PathBuf::from(skey.replace("\0", "")), inode);
-            self.manifest.save()?;
-        }
-        str_key
+    fn create_fs_objects(
+        &mut self,
+        full_path: &Path,
+        kind: FileKind,
+        size: Option<u64>,
+        mode: Option<u16>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<()> {
+        let inode = self.next_ino();
+        let obj = Object::new(full_path, inode, kind, size, mode, uid, gid)?;
+
+        self.manifest.objects.insert(inode, obj);
+        self.manifest.inodes.insert(full_path.to_path_buf(), inode);
+
+        debug!("Added {} (ino={inode})", full_path.display());
+
+        self.manifest.save()?;
+
+        Ok(())
     }
 
     /// Remove a file
@@ -233,13 +243,20 @@ impl Lis {
     }
 
     /// Get contents of a file
-    pub async fn get_file(&mut self, path: &Path) -> Result<Bytes> {
-        let key = key_from_file(Path::new(""), path)?;
+    pub async fn get_file(&mut self, full_path: &Path) -> Result<Bytes> {
+        let key = key_from_file(Path::new(""), full_path)?;
 
         // get content of the key from doc
         let query = Query::key_exact(key);
-        let entry = self
-            .root_doc
+        let doc = self
+            .find_dir_doc(
+                &full_path
+                    .parent()
+                    .ok_or(anyhow!("Could not find Doc for parent dir"))?
+                    .to_path_buf(),
+            )
+            .await?;
+        let entry = doc
             .get_one(query)
             .await?
             .ok_or_else(|| anyhow!("entry not found"))?;
@@ -265,27 +282,54 @@ impl Lis {
             .objects
             .get(&parent)
             .ok_or(anyhow!("could not find parent's inode"))?;
-        Ok(parent_obj.path.join(name))
+        Ok(parent_obj.full_path.join(name))
     }
 
     /// Create directory if doesn't already exist
-    pub async fn mkdir(&mut self, full_path: &PathBuf) -> Result<NamespaceId> {
-        let mut path = full_path.clone();
+    pub async fn mkdir(
+        &mut self,
+        full_path: &PathBuf,
+        mode: Option<u16>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<NamespaceId> {
+        // find parent dir
+        // if we're creating /1/2/3, this will find the doc of /1/2
+        let parent_doc = self
+            .find_dir_doc(
+                &full_path
+                    .parent()
+                    .ok_or(anyhow!("Could not find Doc for parent dir"))?
+                    .to_path_buf(),
+            )
+            .await?;
 
+        let relpath = Path::new(
+            full_path
+                .file_name()
+                .ok_or(anyhow!("Could not get last dir name"))?,
+        );
+
+        // create doc representing dir
+        let doc = self.create_doc(&parent_doc, relpath).await?;
+
+        // add needed objects to fs structure (fuse)
+        self.create_fs_objects(full_path, FileKind::Directory, None, mode, uid, gid)?;
+        debug!("Created directory {}", full_path.display());
+
+        Ok(doc.id())
+    }
+
+    async fn find_dir_doc(&self, full_path: &PathBuf) -> Result<Doc> {
+        // strip leading / from path
+        let mut path = full_path.clone();
         if path.starts_with("/") {
             path = path.strip_prefix("/")?.to_path_buf();
         }
 
-        let mut doc = self.root_doc.clone();
-
         // iterate until last dir
-        let mut iter = path.iter().peekable();
-        while let Some(dir) = iter.next() {
-            if iter.peek().is_none() {
-                // create new doc if this is the last item
-                doc = self.create_doc(&doc, Path::new(dir)).await?;
-                break;
-            }
+        let mut doc = self.root_doc.clone();
+        for dir in &path {
             doc = match self.next_doc(&doc, Path::new(dir)).await? {
                 Some(next_doc) => next_doc,
                 None => {
@@ -296,8 +340,7 @@ impl Lis {
                 }
             };
         }
-
-        Ok(doc.id())
+        Ok(doc)
     }
 
     /// Gets next doc from base_doc and key
@@ -317,14 +360,11 @@ impl Lis {
     }
     /// Creates new Doc with name `next_key` and `base_doc` as its parent
     async fn create_doc(&mut self, base_doc: &Doc, dir_name: &Path) -> Result<Doc> {
-        // check if key already exists
+        // check if key already exists in base_doc
         let key = key_from_file(Path::new(""), dir_name)?;
         let query = Query::key_exact(key.clone());
         if let Some(_doc_id) = base_doc.get_one(query).await? {
-            return Err(anyhow!(
-                "cannot create directory {}, already exists",
-                dir_name.display()
-            ));
+            return Err(anyhow!("cannot create directory, already exists"));
         }
 
         // Doc doesn't already exist, create new Doc
@@ -333,9 +373,6 @@ impl Lis {
         base_doc
             .set_bytes(author, key, namespaceid_to_bytes(new_doc.id()))
             .await?;
-
-        self.create_fs_objects(dir_name, FileKind::Directory)?;
-        debug!("Created directory {}", dir_name.display());
 
         Ok(new_doc)
     }
@@ -364,9 +401,13 @@ mod tests {
         let mut file = NamedTempFile::new_in(file_path).expect("Could not create named temp file");
         let content = "Brian was here. Briefly.";
         write!(file, "{}", content).expect("Could not write to named temp file");
+        let src_path = file.path();
+        let dst_path = Path::new(file.path().file_name().unwrap());
 
-        lis.put(file.path()).await.expect("Could not put file"); // should succeed
-        let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
+        lis.put(src_path, dst_path)
+            .await
+            .expect("Could not put file"); // should succeed
+        let get_content = lis.get_file(dst_path).await.expect("Could not get file"); // should succeed
         assert_eq!(get_content, content);
     }
 
@@ -379,16 +420,23 @@ mod tests {
         let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
         let content = "Brian was here. Briefly.";
         write!(file, "{}", content).expect("Could not write to named temp file");
+        let binding = file.path().to_path_buf();
+        let dst_path = Path::new(binding.file_name().unwrap());
 
         // put file twice
-        lis.put(file.path()).await.expect("Could not put file"); // should succeed
+        lis.put(file.path(), dst_path)
+            .await
+            .expect("Could not put file"); // should succeed
 
         // but second time has more content
         let more_content = " more";
         write!(file, "{}", more_content).expect("Could not write to named temp file");
-        lis.put(file.path()).await.expect("Could not put file"); // should succeed
 
-        let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
+        lis.put(file.path(), dst_path)
+            .await
+            .expect("Could not put file");
+
+        let get_content = lis.get_file(dst_path).await.expect("Could not get file"); // should succeed
 
         let files = lis.list(Path::new("/")).await.expect("Could not get file"); // should succeed
 
@@ -406,19 +454,76 @@ mod tests {
         let content = "Brian was here. Briefly.";
         write!(file, "{}", content).expect("Could not write to named temp file");
 
+        let binding = file.path().to_path_buf();
+        let dst_path = Path::new(binding.file_name().unwrap());
+
         // put file twice
-        lis.put(file.path()).await.expect("Could not put file"); // should succeed
+        lis.put(file.path(), dst_path)
+            .await
+            .expect("Could not put file");
 
         // but second time has more content
         let more_content = " more";
         write!(file, "{}", more_content).expect("Could not write to named temp file");
-        lis.put(file.path()).await.expect("Could not put file"); // should succeed
+        lis.put(file.path(), dst_path)
+            .await
+            .expect("Could not put file");
 
-        let get_content = lis.get_file(file.path()).await.expect("Could not get file"); // should succeed
+        let get_content = lis.get_file(dst_path).await.expect("Could not get file"); // should succeed
 
         let files = lis.list(Path::new("/")).await.expect("Could not get file"); // should succeed
 
         assert_eq!(get_content, "Brian was here. Briefly. more"); // new content should be there
         assert_eq!(files.len(), 1); // there should only be one file
+    }
+
+    #[tokio::test]
+    async fn mkdir() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut lis = setup_lis(&tmp_dir).await;
+
+        // Create a file inside of `env::temp_dir()`.
+        let mut file = NamedTempFile::new_in("/tmp/").unwrap();
+        let content = "Brian was here. Briefly.";
+        write!(file, "{}", content).unwrap();
+
+        // create dir structure
+        // check if 1 was created in /
+        lis.mkdir(&Path::new("/1").to_path_buf(), None, None, None)
+            .await
+            .unwrap();
+        let entries = lis.list(Path::new("/")).await.unwrap(); // should succeed
+        assert_eq!(entries.len(), 1); // there should only be one dir
+
+        // check if 2 was created in /1
+        lis.mkdir(&Path::new("/1/2").to_path_buf(), None, None, None)
+            .await
+            .unwrap();
+        let entries = lis.list(Path::new("/1")).await.unwrap(); // should succeed
+        assert_eq!(entries.len(), 1); // there should only be one dir
+
+        // check if 3 was created in /1/2
+        lis.mkdir(&Path::new("/1/2/3").to_path_buf(), None, None, None)
+            .await
+            .unwrap();
+        let entries = lis.list(Path::new("/1/2")).await.unwrap(); // should succeed
+        assert_eq!(entries.len(), 1); // there should only be one dir
+
+        // add file /1/2/3/myfile.txt
+        let src_path = file.path();
+        let dst_path = Path::new("/1/2/3").join(file.path().file_name().unwrap());
+
+        // put file twice
+        lis.put(src_path, &dst_path)
+            .await
+            .expect("Could not put file");
+
+        // check if file was created in path
+        let files = lis.list(Path::new("/1/2/3")).await.unwrap(); // should succeed
+        assert_eq!(files.len(), 1); // there should be exactly one file
+
+        // retrieve content from the file
+        let get_content = lis.get_file(&dst_path).await.unwrap(); // should succeed
+        assert_eq!(get_content, "Brian was here. Briefly."); // new content should be there
     }
 }

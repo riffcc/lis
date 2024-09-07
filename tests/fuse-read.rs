@@ -1,5 +1,5 @@
 use lis::Lis;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io::Write};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::task;
@@ -35,10 +35,9 @@ async fn test_readdir_empty() {
     .await
     .expect("Failed to read directory");
 
+    // Check if all entries are read-write
     for entry in entries {
-        println!("{}", entry.path().display());
-        // Check if all entries are readonly
-        assert!(entry.metadata().unwrap().permissions().readonly());
+        assert_eq!(false, entry.metadata().unwrap().permissions().readonly());
     }
 }
 
@@ -53,7 +52,9 @@ async fn test_readdir_non_empty() {
     let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
     let content = "Brian was here. Briefly.";
     write!(file, "{}", content).expect("Could not write to named temp file");
-    lis.put(file.path()).await.expect("Could not put file");
+    lis.put(file.path(), Path::new(file.path().file_name().unwrap()))
+        .await
+        .expect("Could not put file"); // should succeed
 
     // Mount Lis
     let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");
@@ -64,8 +65,9 @@ async fn test_readdir_non_empty() {
     let entries = task::spawn_blocking(move || {
         let mut results = vec![];
         for entry in fs::read_dir(mountpoint).unwrap() {
-            let entry = entry.unwrap();
-            results.push(entry);
+            if let Ok(entry) = entry {
+                results.push(entry);
+            }
         }
         results
     })
@@ -74,9 +76,9 @@ async fn test_readdir_non_empty() {
 
     assert_eq!(entries.len(), 1);
 
-    // Check if entries are readonly
+    // Check if all entries are read-write
     for entry in entries {
-        assert!(entry.metadata().unwrap().permissions().readonly());
+        assert_eq!(false, entry.metadata().unwrap().permissions().readonly());
     }
 }
 
@@ -91,7 +93,9 @@ async fn test_read() {
     let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
     let content = "Brian was here. Briefly.";
     write!(file, "{}", content).expect("Could not write to named temp file");
-    lis.put(file.path()).await.expect("Could not put file");
+    lis.put(file.path(), Path::new(file.path().file_name().unwrap()))
+        .await
+        .expect("Could not put file"); // should succeed
 
     // Mount Lis
     let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");

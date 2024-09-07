@@ -18,15 +18,24 @@ pub fn bytes_to_namespaceid(bytes: Bytes) -> Result<NamespaceId> {
     Ok(array.into())
 }
 
+pub fn add_leading_slash(path: &Path) -> PathBuf {
+    if !path.starts_with("/") {
+        let mut new_path = PathBuf::from("/");
+        new_path.push(path);
+        new_path
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Generates a canonicalized key derived from `path` given a node's `root` dir path
 pub fn key_from_file(root: &Path, path: &Path) -> Result<Bytes> {
     // Key is self.root + / + filename
-    let mut prefix = root
+    let prefix = root
         .as_os_str()
         .to_owned()
         .into_string()
         .expect("Could not make file path into string");
-    prefix.push('/');
 
     let root: PathBuf = path
         .parent()
@@ -42,9 +51,10 @@ pub fn key_from_file(root: &Path, path: &Path) -> Result<Bytes> {
 
 pub fn key_to_string(key: Bytes) -> Result<String> {
     let key_str = std::str::from_utf8(key.as_ref())?;
-    Ok(key_str.to_string())
+    Ok(key_str.trim_end_matches('\0').to_string())
 }
 
+#[allow(unused)]
 pub fn get_paths_in_dir(dir_path: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
 
@@ -75,5 +85,23 @@ mod tests {
         let bytes = namespaceid_to_bytes(doc.id());
         let id = bytes_to_namespaceid(bytes).unwrap();
         assert_eq!(doc.id(), id);
+    }
+
+    #[tokio::test]
+    async fn test_string_to_key() {
+        let path = Path::new("/3");
+        let key = key_from_file(Path::new(""), path).unwrap();
+        let path_str = key_to_string(key).unwrap();
+        let converted_path = Path::new(&path_str);
+        assert_eq!(Path::new("3"), converted_path);
+    }
+
+    #[tokio::test]
+    async fn test_add_leading_slash() {
+        let path = Path::new("/3");
+        let key = key_from_file(Path::new(""), path).unwrap();
+        let path_str = key_to_string(key).unwrap();
+        let converted_path = Path::new(&path_str);
+        assert_eq!(Path::new("3"), converted_path);
     }
 }

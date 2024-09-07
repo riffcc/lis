@@ -24,6 +24,10 @@ impl Manifest {
             Path::new("/"),
             cur_ino.fetch_add(1, Ordering::SeqCst),
             FileKind::Directory,
+            None,
+            None,
+            None,
+            None,
         )?;
 
         let mut objects = BTreeMap::new();

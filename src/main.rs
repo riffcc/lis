@@ -39,7 +39,8 @@ async fn main() -> Result<()> {
                 info!(
                     "Added {} (keys: {:#?})",
                     path.display(),
-                    lis.put(path.as_path()).await?
+                    lis.put(path.as_path(), Path::new(path.file_name().unwrap()))
+                        .await?
                 );
             }
         }
@@ -47,7 +48,7 @@ async fn main() -> Result<()> {
             info!(
                 "Created {} (id: {:#?})",
                 path.display(),
-                lis.mkdir(path).await?
+                lis.mkdir(path, None, None, None).await?
             );
         }
         Commands::List { path } => {
