@@ -15,11 +15,13 @@ pub struct Manifest {
     /// Maps object keys to inodes
     pub inodes: BTreeMap<PathBuf, Inode>, // key -> inode
     pub cur_ino: AtomicU64,
+    pub cur_fh: AtomicU64,
 }
 
 impl Manifest {
     pub fn new(manifest_path: PathBuf, doc_id: String) -> Result<Self> {
         let cur_ino = AtomicU64::new(1);
+        let cur_fh = AtomicU64::new(1);
         let root_obj = Object::new(
             Path::new("/"),
             cur_ino.fetch_add(1, Ordering::SeqCst),
@@ -42,6 +44,7 @@ impl Manifest {
             objects,
             inodes,
             cur_ino,
+            cur_fh,
         })
     }
 

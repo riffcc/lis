@@ -7,13 +7,15 @@ pub use std::{
 
 pub use anyhow::{anyhow, Result};
 #[allow(unused)]
-pub use fuser::{FileType, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
+pub use fuser::{FileType, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request};
 #[allow(unused)]
 pub use log::{debug, error, info, warn, LevelFilter};
 pub use serde::{Deserialize, Serialize};
 
 pub use crate::Lis;
+
 pub type Inode = u64;
+pub type FileHandle = u64;
 
 pub const BLOCK_SIZE: u64 = 512;
 pub const MAX_NAME_LENGTH: u32 = 255;

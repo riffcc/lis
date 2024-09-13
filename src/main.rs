@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            println!("\n\n\tlis --root <some_root> join {ticket}\n");
+            println!("\n\n\tlis <lis_root> join {ticket}\n");
             handle.await?;
         }
         Commands::Mount { mountpoint } => {

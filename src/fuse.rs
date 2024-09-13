@@ -1,7 +1,9 @@
 #[allow(unused)]
 use std::{
     ffi::OsStr,
-    os::unix::ffi::OsStrExt,
+    fs::{File, OpenOptions},
+    io::{Seek, SeekFrom, Write},
+    os::unix::{ffi::OsStrExt, io::IntoRawFd},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -54,6 +56,256 @@ impl fuser::Filesystem for Lis {
             reply.attr(&ttl, &obj.attr.clone().into());
         } else {
             reply.error(ENOSYS);
+        }
+    }
+    fn open(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        debug!("open() called for {:?}", ino);
+        let (access_mask, read, write) = match flags & libc::O_ACCMODE {
+            libc::O_RDONLY => {
+                // Behavior is undefined, but most filesystems return EACCES
+                if flags & libc::O_TRUNC != 0 {
+                    reply.error(libc::EACCES);
+                    return;
+                }
+                if flags & FMODE_EXEC != 0 {
+                    // Open is from internal exec syscall
+                    (libc::X_OK, true, false)
+                } else {
+                    (libc::R_OK, true, false)
+                }
+            }
+            libc::O_WRONLY => (libc::W_OK, false, true),
+            libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
+            // Exactly one access mode flag must be specified
+            _ => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        match self.manifest.objects.get(&ino) {
+            Some(obj) => {
+                let mut attr = obj.attr.clone();
+                if check_access(
+                    attr.uid,
+                    attr.gid,
+                    attr.mode,
+                    req.uid(),
+                    req.gid(),
+                    access_mask,
+                ) {
+                    attr.open_file_handles += 1;
+                    if let Err(e) = self.write_inode(&attr) {
+                        error!("{e}");
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                    let open_flags = fuser::consts::FOPEN_DIRECT_IO;
+                    reply.opened(self.next_file_handle(read, write), open_flags);
+                } else {
+                    reply.error(libc::EACCES);
+                }
+                return;
+            }
+            None => reply.error(libc::ENOENT),
+        }
+    }
+
+    // fn create(
+    //     &mut self,
+    //     req: &Request,
+    //     parent: u64,
+    //     name: &OsStr,
+    //     mut mode: u32,
+    //     _umask: u32,
+    //     flags: i32,
+    //     reply: ReplyCreate,
+    // ) {
+    //     debug!("create() called with {:?} {:?}", parent, name);
+    //     let (mut parent_attr, parent_path) = match self.manifest.objects.get(&parent) {
+    //         Some(obj) => (obj.attr.clone(), obj.full_path.clone()),
+    //         None => {
+    //             error!("Could not find parent at inode {parent}");
+    //             reply.error(libc::ENOENT);
+    //             return;
+    //         }
+    //     };
+    //     let full_path = parent_path.join(name);
+
+    //     // check if file already exists
+    //     match handle.block_on(self.list(&parent_path)) {
+    //         Ok(entries) => {
+    //             let new_path_key = key_from_file(Path::new(""), Path::new(name)).unwrap();
+    //             let already_present = entries.iter().any(|entry| match entry {
+    //                 Ok(entry) => entry.key() == new_path_key,
+    //                 Err(_) => false,
+    //             });
+    //             if already_present == true {
+    //                 reply.error(libc::EEXIST);
+    //                 return;
+    //             }
+    //         }
+    //         Err(_e) => {
+    //             error!("Could not list entries for {}", parent_path.display());
+    //             reply.error(libc::ENOENT);
+    //             return;
+    //         }
+    //     }
+
+    //     let (read, write) = match flags & libc::O_ACCMODE {
+    //         libc::O_RDONLY => (true, false),
+    //         libc::O_WRONLY => (false, true),
+    //         libc::O_RDWR => (true, true),
+    //         // Exactly one access mode flag must be specified
+    //         _ => {
+    //             reply.error(libc::EINVAL);
+    //             return;
+    //         }
+    //     };
+
+    //     if !check_access(
+    //         parent_attr.uid,
+    //         parent_attr.gid,
+    //         parent_attr.mode,
+    //         req.uid(),
+    //         req.gid(),
+    //         libc::W_OK,
+    //     ) {
+    //         reply.error(libc::EACCES);
+    //         return;
+    //     }
+    //     parent_attr.last_modified = SystemTime::now();
+    //     parent_attr.last_metadata_changed = SystemTime::now();
+    //     self.write_inode(&parent_attr);
+
+    //     if req.uid() != 0 {
+    //         mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
+    //     }
+
+    //     let inode = self.next_ino();
+    //     let attr = InodeAttributes {
+    //         inode,
+    //         open_file_handles: 1,
+    //         size: 0,
+    //         last_accessed: SystemTime::now(),
+    //         last_modified: SystemTime::now(),
+    //         last_metadata_changed: SystemTime::now(),
+    //         kind: as_file_kind(mode),
+    //         mode: self.creation_mode(mode),
+    //         hardlinks: 1,
+    //         uid: req.uid(),
+    //         gid: creation_gid(&parent_attr, req.gid()),
+    //         xattrs: Default::default(),
+    //     };
+    //     self.write_inode(&attr);
+    //     File::create(self.content_path(inode)).unwrap();
+
+    //     // TODO: put file to lis
+
+    //     reply.created(
+    //         &Duration::new(0, 0),
+    //         &attr.into(),
+    //         0,
+    //         self.next_file_handle(read, write),
+    //         0,
+    //     );
+    // }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let (path, mut attr) = match self.manifest.objects.get(&ino) {
+            Some(obj) => (obj.full_path.to_path_buf(), obj.attr.clone()),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        if let Ok(file) = OpenOptions::new().write(true).open(path) {
+            unsafe {
+                libc::fallocate64(file.into_raw_fd(), mode, offset, length);
+            }
+            if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
+                attr.last_metadata_changed = SystemTime::now();
+                attr.last_modified = SystemTime::now();
+                if (offset + length) as u64 > attr.size {
+                    attr.size = (offset + length) as u64;
+                }
+                if let Err(e) = self.write_inode(&attr) {
+                    error!("{e}");
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+            reply.ok();
+        } else {
+            reply.error(libc::ENOENT);
+        }
+    }
+
+    fn opendir(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        debug!("opendir() called on {:?}", ino);
+        let (access_mask, read, write) = match flags & libc::O_ACCMODE {
+            libc::O_RDONLY => {
+                // Behavior is undefined, but most filesystems return EACCES
+                if flags & libc::O_TRUNC != 0 {
+                    reply.error(libc::EACCES);
+                    return;
+                }
+                (libc::R_OK, true, false)
+            }
+            libc::O_WRONLY => (libc::W_OK, false, true),
+            libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
+            // Exactly one access mode flag must be specified
+            _ => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        match self.manifest.objects.get(&ino) {
+            Some(obj) => {
+                let mut attr = obj.attr.clone();
+                if check_access(
+                    attr.uid,
+                    attr.gid,
+                    attr.mode,
+                    req.uid(),
+                    req.gid(),
+                    access_mask,
+                ) {
+                    attr.open_file_handles += 1;
+                    if let Err(e) = self.write_inode(&attr) {
+                        error!("{e}");
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                    let open_flags = fuser::consts::FOPEN_DIRECT_IO;
+                    reply.opened(self.next_file_handle(read, write), open_flags);
+                } else {
+                    reply.error(libc::EACCES);
+                }
+                return;
+            }
+            None => reply.error(libc::ENOENT),
         }
     }
     fn readdir(
@@ -256,6 +508,56 @@ impl fuser::Filesystem for Lis {
         }
         reply.error(libc::ENOENT);
     }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        debug!("write() called with {:?} size={:?}", ino, data.len());
+        assert!(offset >= 0);
+        if !check_file_handle_write(fh) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        let (obj, path) = match self.manifest.objects.get(&ino) {
+            Some(obj) => (obj, obj.full_path.clone()),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        if let Ok(mut file) = OpenOptions::new().write(true).open(path) {
+            file.seek(SeekFrom::Start(offset as u64)).unwrap();
+            file.write_all(data).unwrap();
+
+            let mut attr = obj.attr.clone();
+            attr.last_metadata_changed = SystemTime::now();
+            attr.last_modified = SystemTime::now();
+            if data.len() + offset as usize > attr.size as usize {
+                attr.size = (data.len() + offset as usize) as u64;
+            }
+            clear_suid_sgid(&mut attr);
+            if let Err(e) = self.write_inode(&attr) {
+                error!("Could not write: {e}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+
+            reply.written(data.len() as u32);
+        } else {
+            reply.error(libc::EBADF);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -295,6 +597,14 @@ fn creation_gid(parent: &InodeAttributes, gid: u32) -> u32 {
     gid
 }
 
+fn clear_suid_sgid(attr: &mut InodeAttributes) {
+    attr.mode &= !libc::S_ISUID as u16;
+    // SGID is only suppose to be cleared if XGRP is set
+    if attr.mode & libc::S_IXGRP as u16 != 0 {
+        attr.mode &= !libc::S_ISGID as u16;
+    }
+}
+
 pub fn check_access(
     file_uid: u32,
     file_gid: u32,
@@ -332,6 +642,9 @@ pub fn check_access(
 
 fn check_file_handle_read(file_handle: u64) -> bool {
     (file_handle & FILE_HANDLE_READ_BIT) != 0
+}
+fn check_file_handle_write(file_handle: u64) -> bool {
+    (file_handle & FILE_HANDLE_WRITE_BIT) != 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

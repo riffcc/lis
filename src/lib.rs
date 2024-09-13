@@ -51,13 +51,17 @@ impl Lis {
             let _ = fs::remove_dir_all(root); // don't care about result. if dir not exists it's
                                               // fine
         }
-        // create root path if not exists
-        fs::create_dir_all(root)?;
+        // create root if not exists
+        fs::create_dir_all(root.clone())?;
+        // TODO: also create dir for lis (iroh) metadata inside root if not exists
+        // let metadata_dir = root.join(".lis");
+        // fs::create_dir_all(metadata_dir.clone())?;
 
         let iroh_node = iroh::node::Node::persistent(root).await?.spawn().await?;
         // if manifest.json file found, load it
         // manifest.json holds data about the Files document (which points to all files)
         let manifest_path = root.join("manifest.json");
+        // TODO: let manifest_path = metadata_dir.join("manifest.json");
 
         let (manifest, root_doc) = match Manifest::load(&manifest_path)? {
             Some(manifest) => {
@@ -99,6 +103,24 @@ impl Lis {
             .save()
             .expect("could not write to manifest file");
         ino
+    }
+
+    /// Creates a new file handle for use
+    pub fn next_file_handle(&mut self, read: bool, write: bool) -> FileHandle {
+        let mut fh = self.manifest.cur_fh.fetch_add(1, Ordering::SeqCst).into();
+        // Assert that we haven't run out of file handles
+        assert!(fh < FILE_HANDLE_READ_BIT.min(FILE_HANDLE_WRITE_BIT));
+        if read {
+            fh |= FILE_HANDLE_READ_BIT;
+        }
+        if write {
+            fh |= FILE_HANDLE_WRITE_BIT;
+        }
+        self.manifest
+            .save()
+            .expect("could not write to manifest file");
+
+        fh
     }
 
     /// List all files in node
