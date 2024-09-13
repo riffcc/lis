@@ -7,7 +7,10 @@ pub use std::{
 
 pub use anyhow::{anyhow, Result};
 #[allow(unused)]
-pub use fuser::{FileType, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request};
+pub use fuser::{
+    FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    Request,
+};
 #[allow(unused)]
 pub use log::{debug, error, info, warn, LevelFilter};
 pub use serde::{Deserialize, Serialize};

@@ -22,22 +22,14 @@ async fn test_readdir_empty() {
     let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");
     let _handle = fuser::spawn_mount2(lis, &tmp_mountpoint, &[]).expect("could not mount Lis");
 
-    // Offload blocking `read_dir` operation to a separate thread
     let mountpoint = tmp_mountpoint.path().to_path_buf();
-    let entries = task::spawn_blocking(move || {
-        let mut results = vec![];
-        for entry in fs::read_dir(mountpoint).unwrap() {
-            let entry = entry.unwrap();
-            results.push(entry);
-        }
-        results
-    })
-    .await
-    .expect("Failed to read directory");
-
+    let mut entries = tokio::fs::read_dir(mountpoint).await.unwrap();
     // Check if all entries are read-write
-    for entry in entries {
-        assert_eq!(false, entry.metadata().unwrap().permissions().readonly());
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        assert_eq!(
+            false,
+            entry.metadata().await.unwrap().permissions().readonly()
+        );
     }
 }
 
@@ -102,7 +94,7 @@ async fn test_read() {
     let _handle = fuser::spawn_mount2(lis, &tmp_mountpoint, &[]).expect("could not mount Lis");
 
     // Read added file
-    let contents = fs::read_to_string(file.path()).expect("Should have been able to read the file");
+    let contents = fs::read_to_string(file.path()).expect("Could not read file");
 
     assert_eq!(contents, "Brian was here. Briefly.");
 }

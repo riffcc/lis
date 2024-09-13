@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
             handle.await?;
         }
         Commands::Mount { mountpoint } => {
+            lis.root = mountpoint.clone();
             let _handle = fuser::spawn_mount2(lis, &mountpoint, &[])?;
             let stop = Arc::new(AtomicBool::new(false));
 

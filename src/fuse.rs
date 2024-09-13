@@ -1,16 +1,25 @@
 #[allow(unused)]
 use std::{
+    cmp::min,
     ffi::OsStr,
-    fs::{File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
-    os::unix::{ffi::OsStrExt, io::IntoRawFd},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::FileExt, io::IntoRawFd},
+    },
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
+use fuser::TimeOrNow;
+use fuser::TimeOrNow::Now;
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
+};
+
 use crate::{
     prelude::*,
-    util::{key_from_file, key_to_string},
+    util::{key_from_file, key_to_string, rm_leading_slash},
 };
 
 impl fuser::Filesystem for Lis {
@@ -21,17 +30,17 @@ impl fuser::Filesystem for Lis {
             return;
         }
 
-        let parent_attr = match self.manifest.objects.get(&parent) {
-            Some(obj) => obj.attr.clone(),
+        let parent_attrs = match self.manifest.objects.get(&parent) {
+            Some(obj) => obj.attrs.clone(),
             None => {
                 reply.error(libc::ENOENT);
                 return;
             }
         };
         if !check_access(
-            parent_attr.uid,
-            parent_attr.gid,
-            parent_attr.mode,
+            parent_attrs.uid,
+            parent_attrs.gid,
+            parent_attrs.mode,
             req.uid(),
             req.gid(),
             libc::X_OK,
@@ -45,21 +54,21 @@ impl fuser::Filesystem for Lis {
             .expect("could not get full file name");
 
         match self.obj_from_path(&full_path) {
-            Some(obj) => reply.entry(&Duration::new(0, 0), &obj.attr.clone().into(), 0),
+            Some(obj) => reply.entry(&Duration::new(0, 0), &obj.attrs.clone().into(), 0),
             None => reply.error(ENOENT),
         }
     }
+
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         debug!("getattr(ino={ino})");
-        let ttl = Duration::new(1, 0);
-        if let Some(obj) = self.manifest.objects.get(&ino) {
-            reply.attr(&ttl, &obj.attr.clone().into());
-        } else {
-            reply.error(ENOSYS);
+        match self.manifest.objects.get(&ino) {
+            Some(obj) => reply.attr(&Duration::new(1, 0), &obj.attrs.clone().into()),
+            None => reply.error(ENOSYS),
         }
     }
+
     fn open(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-        debug!("open() called for {:?}", ino);
+        debug!("open(ino={ino})");
         let (access_mask, read, write) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
                 // Behavior is undefined, but most filesystems return EACCES
@@ -85,17 +94,17 @@ impl fuser::Filesystem for Lis {
 
         match self.manifest.objects.get(&ino) {
             Some(obj) => {
-                let mut attr = obj.attr.clone();
+                let mut attrs = obj.attrs.clone();
                 if check_access(
-                    attr.uid,
-                    attr.gid,
-                    attr.mode,
+                    attrs.uid,
+                    attrs.gid,
+                    attrs.mode,
                     req.uid(),
                     req.gid(),
                     access_mask,
                 ) {
-                    attr.open_file_handles += 1;
-                    if let Err(e) = self.write_inode(&attr) {
+                    attrs.open_file_handles += 1;
+                    if let Err(e) = self.write_inode(&attrs) {
                         error!("{e}");
                         reply.error(libc::ENOENT);
                         return;
@@ -105,151 +114,390 @@ impl fuser::Filesystem for Lis {
                 } else {
                     reply.error(libc::EACCES);
                 }
-                return;
             }
             None => reply.error(libc::ENOENT),
         }
     }
 
-    // fn create(
-    //     &mut self,
-    //     req: &Request,
-    //     parent: u64,
-    //     name: &OsStr,
-    //     mut mode: u32,
-    //     _umask: u32,
-    //     flags: i32,
-    //     reply: ReplyCreate,
-    // ) {
-    //     debug!("create() called with {:?} {:?}", parent, name);
-    //     let (mut parent_attr, parent_path) = match self.manifest.objects.get(&parent) {
-    //         Some(obj) => (obj.attr.clone(), obj.full_path.clone()),
-    //         None => {
-    //             error!("Could not find parent at inode {parent}");
-    //             reply.error(libc::ENOENT);
-    //             return;
-    //         }
-    //     };
-    //     let full_path = parent_path.join(name);
-
-    //     // check if file already exists
-    //     match handle.block_on(self.list(&parent_path)) {
-    //         Ok(entries) => {
-    //             let new_path_key = key_from_file(Path::new(""), Path::new(name)).unwrap();
-    //             let already_present = entries.iter().any(|entry| match entry {
-    //                 Ok(entry) => entry.key() == new_path_key,
-    //                 Err(_) => false,
-    //             });
-    //             if already_present == true {
-    //                 reply.error(libc::EEXIST);
-    //                 return;
-    //             }
-    //         }
-    //         Err(_e) => {
-    //             error!("Could not list entries for {}", parent_path.display());
-    //             reply.error(libc::ENOENT);
-    //             return;
-    //         }
-    //     }
-
-    //     let (read, write) = match flags & libc::O_ACCMODE {
-    //         libc::O_RDONLY => (true, false),
-    //         libc::O_WRONLY => (false, true),
-    //         libc::O_RDWR => (true, true),
-    //         // Exactly one access mode flag must be specified
-    //         _ => {
-    //             reply.error(libc::EINVAL);
-    //             return;
-    //         }
-    //     };
-
-    //     if !check_access(
-    //         parent_attr.uid,
-    //         parent_attr.gid,
-    //         parent_attr.mode,
-    //         req.uid(),
-    //         req.gid(),
-    //         libc::W_OK,
-    //     ) {
-    //         reply.error(libc::EACCES);
-    //         return;
-    //     }
-    //     parent_attr.last_modified = SystemTime::now();
-    //     parent_attr.last_metadata_changed = SystemTime::now();
-    //     self.write_inode(&parent_attr);
-
-    //     if req.uid() != 0 {
-    //         mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
-    //     }
-
-    //     let inode = self.next_ino();
-    //     let attr = InodeAttributes {
-    //         inode,
-    //         open_file_handles: 1,
-    //         size: 0,
-    //         last_accessed: SystemTime::now(),
-    //         last_modified: SystemTime::now(),
-    //         last_metadata_changed: SystemTime::now(),
-    //         kind: as_file_kind(mode),
-    //         mode: self.creation_mode(mode),
-    //         hardlinks: 1,
-    //         uid: req.uid(),
-    //         gid: creation_gid(&parent_attr, req.gid()),
-    //         xattrs: Default::default(),
-    //     };
-    //     self.write_inode(&attr);
-    //     File::create(self.content_path(inode)).unwrap();
-
-    //     // TODO: put file to lis
-
-    //     reply.created(
-    //         &Duration::new(0, 0),
-    //         &attr.into(),
-    //         0,
-    //         self.next_file_handle(read, write),
-    //         0,
-    //     );
-    // }
-
-    fn flush(
+    fn release(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        fh: u64,
-        lock_owner: u64,
-        reply: fuser::ReplyEmpty,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
     ) {
+        if let Some(obj) = self.manifest.objects.get(&ino) {
+            let mut attrs = obj.attrs.clone();
+            attrs.open_file_handles -= 1;
+            if let Err(e) = self.write_inode(&attrs) {
+                error!("{e}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+        }
+        reply.ok();
+    }
+
+    fn create(
+        &mut self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mut mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        debug!("create(parent={:?}, name={:?})", parent, name);
+
+        let handle = self.rt.clone();
+
+        let (mut parent_attrs, parent_path) = match self.manifest.objects.get(&parent) {
+            Some(obj) => (obj.attrs.clone(), obj.full_path.clone()),
+            None => {
+                error!("Could not find parent at inode {parent}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // check if file already exists
+        match handle.block_on(self.list(&parent_path)) {
+            Ok(entries) => {
+                let new_path_key = key_from_file(Path::new(""), Path::new(name)).unwrap();
+                let already_present = entries.iter().any(|entry| match entry {
+                    Ok(entry) => entry.key() == new_path_key,
+                    Err(_) => false,
+                });
+                if already_present == true {
+                    reply.error(libc::EEXIST);
+                    return;
+                }
+            }
+            Err(_e) => {
+                error!("Could not list entries for {}", parent_path.display());
+                reply.error(libc::ENOENT);
+                return;
+            }
+        }
+
+        let (read, write) = match flags & libc::O_ACCMODE {
+            libc::O_RDONLY => (true, false),
+            libc::O_WRONLY => (false, true),
+            libc::O_RDWR => (true, true),
+            // Exactly one access mode flag must be specified
+            _ => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = parent_path.join(name);
+        if !check_access(
+            parent_attrs.uid,
+            parent_attrs.gid,
+            parent_attrs.mode,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        ) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        let uid = req.uid();
+        let gid = creation_gid(&parent_attrs, req.gid());
+
+        if uid != 0 {
+            mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
+        }
+
+        // Create new file on lis
+        if let Err(e) =
+            handle.block_on(self.touch(&full_path, Some(mode as u16), Some(uid), Some(gid)))
+        {
+            error!("Could not put file on lis: {e}");
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        parent_attrs.last_modified = SystemTime::now();
+        parent_attrs.last_metadata_changed = SystemTime::now();
+        if let Err(e) = self.write_inode(&parent_attrs) {
+            error!("Could not write inode: {e}");
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        // get attrs of newly created file
+        let mut attrs = match self.obj_from_path(&full_path) {
+            Some(obj) => obj.attrs.clone(),
+            None => {
+                error!("Could not find newly created dir {}", full_path.display());
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        // update attrs of file
+        attrs.open_file_handles = 1;
+        if let Err(e) = self.write_inode(&attrs) {
+            error!("Could not write inode: {e}");
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        reply.created(
+            &Duration::new(0, 0),
+            &attrs.into(),
+            0,
+            self.next_file_handle(read, write),
+            0,
+        );
+    }
+
+    fn setattr(
+        &mut self,
+        req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let handle = self.rt.clone();
+
+        debug!("setattr(ino={ino}, size={size})");
+        let mut attrs = match self.manifest.objects.get(&ino) {
+            Some(obj) => obj.attrs.clone(),
+            None => {
+                error!("Could not find inode {ino}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        if let Some(mode) = mode {
+            debug!("chmod() called with {:?}, {:o}", ino, mode);
+            if req.uid() != 0 && req.uid() != attrs.uid {
+                reply.error(libc::EPERM);
+                return;
+            }
+            if req.uid() != 0
+                && req.gid() != attrs.gid
+                && !handle.block_on(get_groups(req.pid())).contains(&attrs.gid)
+            {
+                // If SGID is set and the file belongs to a group that the caller is not part of
+                // then the SGID bit is suppose to be cleared during chmod
+                attrs.mode = (mode & !libc::S_ISGID as u32) as u16;
+            } else {
+                attrs.mode = mode as u16;
+            }
+            attrs.last_metadata_changed = SystemTime::now();
+            if let Err(e) = self.write_inode(&attrs) {
+                error!("{e}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+            reply.attr(&Duration::new(0, 0), &attrs.into());
+            return;
+        }
+
+        if uid.is_some() || gid.is_some() {
+            debug!("chown() called with {:?} {:?} {:?}", ino, uid, gid);
+            if let Some(gid) = gid {
+                // Non-root users can only change gid to a group they're in
+                if req.uid() != 0 && !handle.block_on(get_groups(req.pid())).contains(&gid) {
+                    reply.error(libc::EPERM);
+                    return;
+                }
+            }
+            if let Some(uid) = uid {
+                if req.uid() != 0
+                    // but no-op changes by the owner are not an error
+                    && !(uid == attrs.uid && req.uid() == attrs.uid)
+                {
+                    reply.error(libc::EPERM);
+                    return;
+                }
+            }
+            // Only owner may change the group
+            if gid.is_some() && req.uid() != 0 && req.uid() != attrs.uid {
+                reply.error(libc::EPERM);
+                return;
+            }
+
+            if attrs.mode & (libc::S_IXUSR | libc::S_IXGRP | libc::S_IXOTH) as u16 != 0 {
+                // SUID & SGID are suppose to be cleared when chown'ing an executable file
+                clear_suid_sgid(&mut attrs);
+            }
+
+            if let Some(uid) = uid {
+                attrs.uid = uid;
+                // Clear SETUID on owner change
+                attrs.mode &= !libc::S_ISUID as u16;
+            }
+            if let Some(gid) = gid {
+                attrs.gid = gid;
+                // Clear SETGID unless user is root
+                if req.uid() != 0 {
+                    attrs.mode &= !libc::S_ISGID as u16;
+                }
+            }
+            attrs.last_metadata_changed = SystemTime::now();
+            if let Err(e) = self.write_inode(&attrs) {
+                error!("{e}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+            reply.attr(&Duration::new(0, 0), &attrs.into());
+            return;
+        }
+
+        if let Some(size) = size {
+            debug!("truncate(ino={ino}, size={size})");
+            if let Some(file_handle) = fh {
+                // If the file handle is available, check access locally.
+                // This is important as it preserves the semantic that a file handle opened
+                // with W_OK will never fail to truncate, even if the file has been subsequently
+                // chmod'ed
+                if check_file_handle_write(file_handle) {
+                    if let Err(error_code) = handle.block_on(self.truncate(ino, size, 0, 0)) {
+                        reply.error(error_code);
+                        return;
+                    }
+                } else {
+                    reply.error(libc::EACCES);
+                    return;
+                }
+            } else if let Err(error_code) =
+                handle.block_on(self.truncate(ino, size, req.uid(), req.gid()))
+            {
+                reply.error(error_code);
+                return;
+            }
+        }
+
+        let now = SystemTime::now();
+        if let Some(atime) = atime {
+            debug!("utimens() called with {:?}, atime={:?}", ino, atime);
+
+            if attrs.uid != req.uid() && req.uid() != 0 && atime != Now {
+                reply.error(libc::EPERM);
+                return;
+            }
+
+            if attrs.uid != req.uid()
+                && !check_access(
+                    attrs.uid,
+                    attrs.gid,
+                    attrs.mode,
+                    req.uid(),
+                    req.gid(),
+                    libc::W_OK,
+                )
+            {
+                reply.error(libc::EACCES);
+                return;
+            }
+
+            attrs.last_accessed = match atime {
+                TimeOrNow::SpecificTime(time) => time,
+                Now => now,
+            };
+            attrs.last_metadata_changed = SystemTime::now();
+            if let Err(e) = self.write_inode(&attrs) {
+                error!("{e}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+        }
+        if let Some(mtime) = mtime {
+            debug!("utimens() called with {:?}, mtime={:?}", ino, mtime);
+
+            if attrs.uid != req.uid() && req.uid() != 0 && mtime != Now {
+                reply.error(libc::EPERM);
+                return;
+            }
+
+            if attrs.uid != req.uid()
+                && !check_access(
+                    attrs.uid,
+                    attrs.gid,
+                    attrs.mode,
+                    req.uid(),
+                    req.gid(),
+                    libc::W_OK,
+                )
+            {
+                reply.error(libc::EACCES);
+                return;
+            }
+
+            attrs.last_modified = match mtime {
+                TimeOrNow::SpecificTime(time) => time,
+                Now => now,
+            };
+            attrs.last_metadata_changed = now;
+            if let Err(e) = self.write_inode(&attrs) {
+                error!("{e}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+        }
+
+        // save new attributes
+        match self.write_inode(&attrs) {
+            Ok(_) => reply.attr(&Duration::new(0, 0), &attrs.into()),
+            Err(e) => {
+                error!("{e}");
+                reply.error(libc::ENOENT);
+            }
+        }
     }
 
     fn fallocate(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         length: i64,
         mode: i32,
         reply: fuser::ReplyEmpty,
     ) {
-        let (path, mut attr) = match self.manifest.objects.get(&ino) {
-            Some(obj) => (obj.full_path.to_path_buf(), obj.attr.clone()),
+        let handle = self.rt.clone();
+
+        let (path, mut attrs) = match self.manifest.objects.get(&ino) {
+            Some(obj) => (obj.full_path.to_path_buf(), obj.attrs.clone()),
             None => {
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        if let Ok(file) = OpenOptions::new().write(true).open(path) {
+        if let Ok(file) = handle.block_on(OpenOptions::new().write(true).open(path)) {
             unsafe {
-                libc::fallocate64(file.into_raw_fd(), mode, offset, length);
+                libc::fallocate64(file.as_raw_fd(), mode, offset, length);
             }
             if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
-                attr.last_metadata_changed = SystemTime::now();
-                attr.last_modified = SystemTime::now();
-                if (offset + length) as u64 > attr.size {
-                    attr.size = (offset + length) as u64;
+                attrs.last_metadata_changed = SystemTime::now();
+                attrs.last_modified = SystemTime::now();
+                if (offset + length) as u64 > attrs.size {
+                    attrs.size = (offset + length) as u64;
                 }
-                if let Err(e) = self.write_inode(&attr) {
+                if let Err(e) = self.write_inode(&attrs) {
                     error!("{e}");
                     reply.error(libc::ENOENT);
                     return;
@@ -283,17 +531,17 @@ impl fuser::Filesystem for Lis {
 
         match self.manifest.objects.get(&ino) {
             Some(obj) => {
-                let mut attr = obj.attr.clone();
+                let mut attrs = obj.attrs.clone();
                 if check_access(
-                    attr.uid,
-                    attr.gid,
-                    attr.mode,
+                    attrs.uid,
+                    attrs.gid,
+                    attrs.mode,
                     req.uid(),
                     req.gid(),
                     access_mask,
                 ) {
-                    attr.open_file_handles += 1;
-                    if let Err(e) = self.write_inode(&attr) {
+                    attrs.open_file_handles += 1;
+                    if let Err(e) = self.write_inode(&attrs) {
                         error!("{e}");
                         reply.error(libc::ENOENT);
                         return;
@@ -343,9 +591,9 @@ impl fuser::Filesystem for Lis {
                     match self.obj_from_path(&full_entry_path) {
                         Some(obj) => {
                             let _ = reply.add(
-                                obj.attr.inode,
+                                obj.attrs.inode,
                                 offset + index as i64 + 1,
-                                obj.attr.kind.into(),
+                                obj.attrs.kind.into(),
                                 &relpath.clone(),
                             );
                         }
@@ -386,10 +634,8 @@ impl fuser::Filesystem for Lis {
         debug!("mkdir() called with {:?} {:?} {:o}", parent, name, mode);
         let handle = self.rt.clone();
 
-        // get object of parent
-        // get path of parent from object
-        let (mut parent_attr, parent_path) = match self.manifest.objects.get(&parent) {
-            Some(obj) => (obj.attr.clone(), obj.full_path.clone()),
+        let (mut parent_attrs, parent_path) = match self.manifest.objects.get(&parent) {
+            Some(obj) => (obj.attrs.clone(), obj.full_path.clone()),
             None => {
                 error!("Could not find parent at inode {parent}");
                 reply.error(libc::ENOENT);
@@ -400,9 +646,9 @@ impl fuser::Filesystem for Lis {
 
         // check if can access parent dir
         if !check_access(
-            parent_attr.uid,
-            parent_attr.gid,
-            parent_attr.mode,
+            parent_attrs.uid,
+            parent_attrs.gid,
+            parent_attrs.mode,
             req.uid(),
             req.gid(),
             libc::W_OK,
@@ -436,11 +682,11 @@ impl fuser::Filesystem for Lis {
         if req.uid() != 0 {
             mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
         }
-        if parent_attr.mode & libc::S_ISGID as u16 != 0 {
+        if parent_attrs.mode & libc::S_ISGID as u16 != 0 {
             mode |= libc::S_ISGID as u32;
         }
         let uid = req.uid();
-        let gid = creation_gid(&parent_attr, req.gid());
+        let gid = creation_gid(&parent_attrs, req.gid());
         if let Err(e) =
             handle.block_on(self.mkdir(&full_path, Some(mode as u16), Some(uid), Some(gid)))
         {
@@ -450,17 +696,17 @@ impl fuser::Filesystem for Lis {
         }
 
         // update parent attributes
-        parent_attr.last_modified = SystemTime::now();
-        parent_attr.last_metadata_changed = SystemTime::now();
-        if let Err(e) = self.write_inode(&parent_attr) {
+        parent_attrs.last_modified = SystemTime::now();
+        parent_attrs.last_metadata_changed = SystemTime::now();
+        if let Err(e) = self.write_inode(&parent_attrs) {
             error!("Could not create dir {}: {e}", full_path.display());
             reply.error(libc::ENOENT);
             return;
         }
 
         // return attrs of newly created dir
-        let attr = match self.obj_from_path(&full_path) {
-            Some(obj) => obj.attr.clone(),
+        let attrs = match self.obj_from_path(&full_path) {
+            Some(obj) => obj.attrs.clone(),
             None => {
                 error!("Could not find newly created dir {}", full_path.display());
                 reply.error(libc::ENOENT);
@@ -468,13 +714,13 @@ impl fuser::Filesystem for Lis {
             }
         };
 
-        reply.entry(&Duration::new(0, 0), &attr.into(), 0);
+        reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
 
     fn read(
         &mut self,
         _req: &Request,
-        inode: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
@@ -482,10 +728,7 @@ impl fuser::Filesystem for Lis {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        debug!(
-            "read() called on {:?} offset={:?} size={:?}",
-            inode, offset, size
-        );
+        debug!("read(ino={ino} offset={offset} size={size})");
         assert!(offset >= 0);
         let handle = self.rt.clone();
 
@@ -494,19 +737,28 @@ impl fuser::Filesystem for Lis {
             return;
         }
 
-        let path = match self.manifest.objects.get(&inode) {
+        let path = match self.manifest.objects.get(&ino) {
             Some(obj) => obj.full_path.clone(),
             None => {
                 reply.error(libc::ENOENT);
                 return;
             }
         };
-        if let Ok(bytes_content) = handle.block_on(self.get_file(&path)) {
-            let buffer: Vec<u8> = bytes_content.to_vec();
-            reply.data(&buffer);
-            return;
+
+        let offset = offset as usize;
+        match handle.block_on(self.get_file(&path)) {
+            Ok(bytes_content) => {
+                let content_size = bytes_content.len();
+                let read_size: usize =
+                    min(size, content_size.saturating_sub(offset) as u32) as usize;
+                let buffer = bytes_content.slice(offset..(offset + read_size));
+                reply.data(&buffer);
+            }
+            Err(e) => {
+                error!("Could not get file: {e}");
+                reply.error(libc::ENOENT);
+            }
         }
-        reply.error(libc::ENOENT);
     }
 
     fn write(
@@ -521,6 +773,8 @@ impl fuser::Filesystem for Lis {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
+        let handle = self.rt.clone();
+
         debug!("write() called with {:?} size={:?}", ino, data.len());
         assert!(offset >= 0);
         if !check_file_handle_write(fh) {
@@ -536,18 +790,21 @@ impl fuser::Filesystem for Lis {
             }
         };
 
-        if let Ok(mut file) = OpenOptions::new().write(true).open(path) {
-            file.seek(SeekFrom::Start(offset as u64)).unwrap();
-            file.write_all(data).unwrap();
+        let full_path = system_full_path(&self.root, &path);
+        if let Ok(mut file) = handle.block_on(OpenOptions::new().write(true).open(full_path)) {
+            handle
+                .block_on(file.seek(SeekFrom::Start(offset as u64)))
+                .unwrap();
+            handle.block_on(file.write_all(data)).unwrap();
 
-            let mut attr = obj.attr.clone();
-            attr.last_metadata_changed = SystemTime::now();
-            attr.last_modified = SystemTime::now();
-            if data.len() + offset as usize > attr.size as usize {
-                attr.size = (data.len() + offset as usize) as u64;
+            let mut attrs = obj.attrs.clone();
+            attrs.last_metadata_changed = SystemTime::now();
+            attrs.last_modified = SystemTime::now();
+            if data.len() + offset as usize > attrs.size as usize {
+                attrs.size = (data.len() + offset as usize) as u64;
             }
-            clear_suid_sgid(&mut attr);
-            if let Err(e) = self.write_inode(&attr) {
+            clear_suid_sgid(&mut attrs);
+            if let Err(e) = self.write_inode(&attrs) {
                 error!("Could not write: {e}");
                 reply.error(libc::ENOENT);
                 return;
@@ -597,11 +854,11 @@ fn creation_gid(parent: &InodeAttributes, gid: u32) -> u32 {
     gid
 }
 
-fn clear_suid_sgid(attr: &mut InodeAttributes) {
-    attr.mode &= !libc::S_ISUID as u16;
+pub fn clear_suid_sgid(attrs: &mut InodeAttributes) {
+    attrs.mode &= !libc::S_ISUID as u16;
     // SGID is only suppose to be cleared if XGRP is set
-    if attr.mode & libc::S_IXGRP as u16 != 0 {
-        attr.mode &= !libc::S_ISGID as u16;
+    if attrs.mode & libc::S_IXGRP as u16 != 0 {
+        attrs.mode &= !libc::S_ISGID as u16;
     }
 }
 
@@ -645,6 +902,30 @@ fn check_file_handle_read(file_handle: u64) -> bool {
 }
 fn check_file_handle_write(file_handle: u64) -> bool {
     (file_handle & FILE_HANDLE_WRITE_BIT) != 0
+}
+async fn get_groups(pid: u32) -> Vec<u32> {
+    {
+        let path = format!("/proc/{pid}/task/{pid}/status");
+        let file = File::open(path).await.unwrap();
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.starts_with("Groups:") {
+                return line["Groups: ".len()..]
+                    .split(' ')
+                    .filter(|x| !x.trim().is_empty())
+                    .map(|x| x.parse::<u32>().unwrap())
+                    .collect();
+            }
+        }
+    }
+
+    vec![]
+}
+
+pub fn system_full_path(mountpoint: &Path, relpath: &Path) -> PathBuf {
+    //remove possible leading / from relpath
+    mountpoint.join(rm_leading_slash(relpath))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

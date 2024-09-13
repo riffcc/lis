@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, fs, str::FromStr, sync::atomic::Ordering};
+use std::{ffi::OsStr, os::raw::c_int, str::FromStr, sync::atomic::Ordering};
 
 use bytes::Bytes;
 use futures_lite::StreamExt;
@@ -8,6 +8,7 @@ use iroh::{
     net::ticket::NodeTicket,
     node::Node,
 };
+use tokio::fs::{self, OpenOptions};
 
 pub mod prelude;
 use prelude::*;
@@ -22,7 +23,7 @@ mod cli;
 pub use cli::{Cli, Commands};
 
 mod fuse;
-use fuse::{FileKind, InodeAttributes};
+use fuse::{check_access, clear_suid_sgid, FileKind, InodeAttributes};
 
 mod object;
 use object::Object;
@@ -35,7 +36,7 @@ pub struct Lis {
     pub manifest: Manifest,
     pub rt: tokio::runtime::Handle,
     root_doc: Doc,
-    _root: PathBuf,
+    pub root: PathBuf,
 }
 
 impl Lis {
@@ -52,7 +53,7 @@ impl Lis {
                                               // fine
         }
         // create root if not exists
-        fs::create_dir_all(root.clone())?;
+        fs::create_dir_all(root.clone()).await?;
         // TODO: also create dir for lis (iroh) metadata inside root if not exists
         // let metadata_dir = root.join(".lis");
         // fs::create_dir_all(metadata_dir.clone())?;
@@ -91,7 +92,7 @@ impl Lis {
             manifest,
             rt: tokio::runtime::Handle::current(),
             root_doc,
-            _root: root.clone(),
+            root: root.clone(),
         };
         Ok(lis)
     }
@@ -121,6 +122,44 @@ impl Lis {
             .expect("could not write to manifest file");
 
         fh
+    }
+
+    /// Create new empty file on lis
+    pub async fn touch(
+        &mut self,
+        full_path: &PathBuf,
+        mode: Option<u16>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<()> {
+        // find doc where file will live
+        let doc = self
+            .find_dir_doc(
+                &full_path
+                    .parent()
+                    .ok_or(anyhow!("Could not find Doc for parent dir"))?
+                    .to_path_buf(),
+            )
+            .await?;
+
+        let key = key_from_file(Path::new(""), &full_path)?;
+
+        // if key already in filesystem, do nothing and return Ok
+        let query = Query::key_exact(key.clone());
+        if doc.get_one(query).await?.is_some() {
+            return Ok(());
+        }
+
+        let default_author = self.iroh_node.authors().default().await?;
+        let content = b"null"; //cannot be b"" because iroh will think it's a deleted file
+        doc.set_bytes(default_author, key.to_vec(), content.to_vec())
+            .await?;
+
+        // add file obj to filesystem
+        let size: u64 = 4;
+        self.create_fs_objects(&full_path, FileKind::File, Some(size), mode, uid, gid)?;
+
+        Ok(())
     }
 
     /// List all files in node
@@ -156,11 +195,11 @@ impl Lis {
         self.manifest.objects.get(&ino)
     }
 
-    pub fn write_inode(&mut self, attr: &InodeAttributes) -> Result<()> {
-        let ino: Inode = attr.inode;
+    pub fn write_inode(&mut self, attrs: &InodeAttributes) -> Result<()> {
+        let ino: Inode = attrs.inode;
         match self.manifest.objects.get_mut(&ino) {
             Some(obj) => {
-                obj.attr = attr.clone();
+                obj.attrs = attrs.clone();
                 self.manifest.save()
             }
             None => Err(anyhow!("could not find object for inode {ino}")),
@@ -178,7 +217,7 @@ impl Lis {
             return Err(anyhow!("Path {} does not exist", src_path.display()));
         }
 
-        let full_src_path = fs::canonicalize(&src_path)?;
+        let full_src_path = fs::canonicalize(&src_path).await?;
         if !full_src_path.is_file() {
             return Err(anyhow!("{} is not a file", full_src_path.display()));
         }
@@ -197,7 +236,7 @@ impl Lis {
             .await?;
 
         // add file obj to filesystem
-        let size = fs::metadata(src_path)?.len();
+        let size = fs::metadata(src_path).await?.len();
         self.create_fs_objects(&full_dst_path, FileKind::File, Some(size), None, None, None)?;
 
         Ok(vec![(
@@ -247,7 +286,7 @@ impl Lis {
         self.manifest.objects.insert(inode, obj);
         self.manifest.inodes.insert(full_path.to_path_buf(), inode);
 
-        debug!("Added {} (ino={inode})", full_path.display());
+        debug!("Created {} (ino={inode})", full_path.display());
 
         self.manifest.save()?;
 
@@ -398,6 +437,56 @@ impl Lis {
 
         Ok(new_doc)
     }
+
+    async fn truncate(
+        &mut self,
+        ino: Inode,
+        new_length: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Result<InodeAttributes, c_int> {
+        if new_length > MAX_FILE_SIZE {
+            return Err(libc::EFBIG);
+        }
+
+        let (mut attrs, obj) = match self.manifest.objects.get(&ino) {
+            Some(obj) => (obj.attrs.clone(), obj),
+            None => {
+                return Err(libc::ENOENT);
+            }
+        };
+
+        if !check_access(attrs.uid, attrs.gid, attrs.mode, uid, gid, libc::W_OK) {
+            return Err(libc::EACCES);
+        }
+
+        let system_full_path = fuse::system_full_path(&self.root, &obj.full_path);
+        debug!("system_full_path={}", system_full_path.display());
+        let file = match OpenOptions::new()
+            .write(true)
+            .open(system_full_path.clone())
+            .await
+        {
+            Ok(file) => file,
+            Err(_e) => return Err(libc::ENOENT),
+        };
+        debug!("opened {}", system_full_path.display());
+        file.set_len(new_length).await.unwrap();
+
+        attrs.size = new_length;
+        attrs.last_metadata_changed = SystemTime::now();
+        attrs.last_modified = SystemTime::now();
+
+        // Clear SETUID & SETGID on truncate
+        clear_suid_sgid(&mut attrs);
+
+        if let Err(e) = self.write_inode(&attrs) {
+            error!("Could not truncate: {e}");
+            return Err(libc::ENOENT);
+        }
+
+        Ok(attrs)
+    }
 }
 
 #[cfg(test)]
@@ -547,5 +636,21 @@ mod tests {
         // retrieve content from the file
         let get_content = lis.get_file(&dst_path).await.unwrap(); // should succeed
         assert_eq!(get_content, "Brian was here. Briefly."); // new content should be there
+    }
+
+    #[tokio::test]
+    async fn touch() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut lis = setup_lis(&tmp_dir).await;
+
+        // Create empty file (touch) in lis
+        let file_path = Path::new("/myfile.txt");
+        lis.touch(&file_path.to_path_buf(), None, None, None)
+            .await
+            .unwrap();
+
+        // retrieve content from the file (should be b"null")
+        let get_content = lis.get_file(file_path).await.unwrap();
+        assert_eq!(get_content, "null");
     }
 }

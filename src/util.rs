@@ -28,6 +28,16 @@ pub fn add_leading_slash(path: &Path) -> PathBuf {
     }
 }
 
+pub fn rm_leading_slash(path: &Path) -> PathBuf {
+    if path.starts_with("/") {
+        let mut components = path.components();
+        components.next(); // remove the first component (/)
+        components.as_path().to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Generates a canonicalized key derived from `path` given a node's `root` dir path
 pub fn key_from_file(root: &Path, path: &Path) -> Result<Bytes> {
     // Key is self.root + / + filename

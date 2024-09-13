@@ -11,7 +11,7 @@ pub struct Object {
     /// Absolute path to object
     pub full_path: PathBuf,
     //TODO: pub parent: Inode, (actually put this in attr)
-    pub attr: InodeAttributes,
+    pub attrs: InodeAttributes,
 }
 
 impl Object {
@@ -24,7 +24,7 @@ impl Object {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<Self> {
-        let attr = match kind {
+        let attrs = match kind {
             FileKind::File => InodeAttributes {
                 inode,
                 open_file_handles: 0,
@@ -57,7 +57,7 @@ impl Object {
         };
         Ok(Object {
             full_path: full_path.to_path_buf(),
-            attr,
+            attrs,
         })
     }
 }
