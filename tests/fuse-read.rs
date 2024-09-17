@@ -44,9 +44,9 @@ async fn test_readdir_non_empty() {
     let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
     let content = "Brian was here. Briefly.";
     write!(file, "{}", content).expect("Could not write to named temp file");
-    lis.put(file.path(), Path::new(file.path().file_name().unwrap()))
+    lis.import_file(file.path(), Path::new(file.path().file_name().unwrap()))
         .await
-        .expect("Could not put file"); // should succeed
+        .expect("Could not import file"); // should succeed
 
     // Mount Lis
     let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");
@@ -85,9 +85,9 @@ async fn test_read() {
     let mut file = NamedTempFile::new_in("/tmp/").expect("Could not create named temp file");
     let content = "Brian was here. Briefly.";
     write!(file, "{}", content).expect("Could not write to named temp file");
-    lis.put(file.path(), Path::new(file.path().file_name().unwrap()))
+    lis.import_file(file.path(), Path::new(file.path().file_name().unwrap()))
         .await
-        .expect("Could not put file"); // should succeed
+        .expect("Could not import file"); // should succeed
 
     // Mount Lis
     let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");

@@ -1,7 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
-use tokio::fs::{self, create_dir_all, DirEntry, File};
+use tokio::{
+    fs::{self, create_dir_all, DirEntry, File},
+    io::AsyncWriteExt,
+};
 
 use lis::Lis;
 
@@ -25,7 +28,6 @@ async fn test_mkdir() {
 
     let mountpoint = tmp_mountpoint.path().to_path_buf();
 
-    // Offload blocking `create_dir` operation to a separate thread
     let path = mountpoint.join("1").join("2");
     create_dir_all(path)
         .await
@@ -33,7 +35,6 @@ async fn test_mkdir() {
 
     let mountpoint = tmp_mountpoint.path().to_path_buf();
 
-    // Offload blocking `read_dir` operation to a separate thread
     let path_1 = mountpoint.join("1");
     let path_2 = mountpoint.join("1").join("2");
 
@@ -72,7 +73,6 @@ async fn test_touch() {
     let mountpoint = tmp_mountpoint.path().to_path_buf();
     let clone_mountpoint = mountpoint.clone();
 
-    // Offload blocking `create_dir` operation to a separate thread
     let path = clone_mountpoint.join("foo.txt");
     let _f = File::create_new(path).await.unwrap();
 
@@ -92,4 +92,28 @@ async fn test_touch() {
     // we need "null" because empty files are interpreted as deleted by iroh
     let contents = fs::read_to_string(path).await.expect("Could not read file");
     assert_eq!(contents, "null");
+}
+
+#[tokio::test]
+async fn test_write() {
+    // Setup Lis
+    let tmp_root = TempDir::new().expect("Could not create temp dir");
+    let lis = setup_lis(&tmp_root).await;
+
+    // Mount Lis
+    let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");
+    let _handle = fuser::spawn_mount2(lis, &tmp_mountpoint, &[]).expect("could not mount Lis");
+
+    let mountpoint = tmp_mountpoint.path().to_path_buf();
+
+    let path = mountpoint.join(Path::new("foo.txt"));
+
+    // open and write to path
+    let mut file = File::create(&path).await.unwrap();
+    file.write_all(b"hello from test_write").await.unwrap();
+
+    let contents = fs::read_to_string(&path)
+        .await
+        .expect("Could not read file");
+    assert_eq!(contents, "hello from test_write");
 }

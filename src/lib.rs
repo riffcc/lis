@@ -8,7 +8,7 @@ use iroh::{
     net::ticket::NodeTicket,
     node::Node,
 };
-use tokio::fs::{self, OpenOptions};
+use tokio::fs;
 
 pub mod prelude;
 use prelude::*;
@@ -133,16 +133,7 @@ impl Lis {
         gid: Option<u32>,
     ) -> Result<()> {
         // find doc where file will live
-        let doc = self
-            .find_dir_doc(
-                &full_path
-                    .parent()
-                    .ok_or(anyhow!("Could not find Doc for parent dir"))?
-                    .to_path_buf(),
-            )
-            .await?;
-
-        let key = key_from_file(Path::new(""), &full_path)?;
+        let (doc, key) = self.doc_and_key(&full_path).await?;
 
         // if key already in filesystem, do nothing and return Ok
         let query = Query::key_exact(key.clone());
@@ -208,7 +199,7 @@ impl Lis {
 
     /// Adds files and directories to Lis
     /// Returns `(path, key)` pairs of the added file upon success
-    pub async fn put(
+    pub async fn import_file(
         &mut self,
         src_path: &Path,
         dst_path: &Path,
@@ -223,19 +214,20 @@ impl Lis {
         }
         let full_dst_path = add_leading_slash(dst_path);
 
-        let doc = self
-            .find_dir_doc(
-                &dst_path
-                    .parent()
-                    .ok_or(anyhow!("Could not find Doc for parent dir"))?
-                    .to_path_buf(),
-            )
-            .await?;
+        // TODO: call write
+        let (doc, key) = self.doc_and_key(&full_dst_path).await?;
 
-        self.put_file_to_doc(&doc, full_src_path.as_path(), &full_dst_path)
-            .await?;
+        let default_author = self.iroh_node.authors().default().await?;
+        let query = Query::key_exact(key.clone());
+        if doc.get_one(query).await?.is_some() {
+            doc.del(default_author, key.clone()).await?; // delete old entry
+        }
 
-        // add file obj to filesystem
+        doc.import_file(default_author, key.clone(), full_src_path, false)
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+
         let size = fs::metadata(src_path).await?.len();
         self.create_fs_objects(&full_dst_path, FileKind::File, Some(size), None, None, None)?;
 
@@ -245,28 +237,55 @@ impl Lis {
         )])
     }
 
-    /// Puts a file to a previously created document
-    /// Returns the key to the added file upon success
-    async fn put_file_to_doc(
-        &mut self,
-        doc: &Doc,
-        import_path: &Path,
-        dst_path: &Path,
-    ) -> Result<()> {
-        let key = key_from_file(Path::new(""), dst_path)?;
+    /// Given a full_path, returns the doc where the file is located and its key in that doc
+    async fn doc_and_key(&self, full_path: &Path) -> Result<(Doc, Bytes)> {
+        let relpath = Path::new(
+            full_path
+                .file_name()
+                .ok_or(anyhow!("Could not get last dir name"))?,
+        );
+        let key = key_from_file(Path::new(""), relpath)?;
 
+        let doc = self
+            .find_dir_doc(
+                &full_path
+                    .parent()
+                    .ok_or(anyhow!("Could not find Doc for parent dir"))?
+                    .to_path_buf(),
+            )
+            .await?;
+
+        Ok((doc, key))
+    }
+
+    /// Writes data to a path
+    async fn write(&mut self, full_path: &Path, data: &[u8], offset: usize) -> Result<()> {
+        let mut content = match self.read(&full_path).await?.try_into_mut() {
+            Ok(mut_content) => mut_content,
+            Err(_) => return Err(anyhow!("Could not get mutable byte array")),
+        };
+
+        // make sure has enough size
+        let required_length = offset + data.len();
+        if required_length > content.len() {
+            content.resize(required_length, 0);
+        };
+
+        // write data at offset
+        content[offset..offset + data.len()].copy_from_slice(data);
+
+        // remove old content
+        let (doc, key) = self.doc_and_key(&full_path).await?;
         let default_author = self.iroh_node.authors().default().await?;
-
-        // if key already in filesystem, remove it first
         let query = Query::key_exact(key.clone());
+
         if doc.get_one(query).await?.is_some() {
             doc.del(default_author, key.clone()).await?; // delete old entry
         }
 
-        doc.import_file(default_author, key.clone(), import_path, false)
-            .await?
-            .collect::<Vec<_>>()
-            .await;
+        // save new buffer to doc
+        doc.set_bytes(default_author, key.to_vec(), content.freeze())
+            .await?;
 
         Ok(())
     }
@@ -304,19 +323,11 @@ impl Lis {
     }
 
     /// Get contents of a file
-    pub async fn get_file(&mut self, full_path: &Path) -> Result<Bytes> {
-        let key = key_from_file(Path::new(""), full_path)?;
+    pub async fn read(&mut self, full_path: &Path) -> Result<Bytes> {
+        let (doc, key) = self.doc_and_key(&full_path).await?;
 
         // get content of the key from doc
         let query = Query::key_exact(key);
-        let doc = self
-            .find_dir_doc(
-                &full_path
-                    .parent()
-                    .ok_or(anyhow!("Could not find Doc for parent dir"))?
-                    .to_path_buf(),
-            )
-            .await?;
         let entry = doc
             .get_one(query)
             .await?
@@ -449,8 +460,8 @@ impl Lis {
             return Err(libc::EFBIG);
         }
 
-        let (mut attrs, obj) = match self.manifest.objects.get(&ino) {
-            Some(obj) => (obj.attrs.clone(), obj),
+        let mut attrs = match self.manifest.objects.get(&ino) {
+            Some(obj) => obj.attrs.clone(),
             None => {
                 return Err(libc::ENOENT);
             }
@@ -459,19 +470,6 @@ impl Lis {
         if !check_access(attrs.uid, attrs.gid, attrs.mode, uid, gid, libc::W_OK) {
             return Err(libc::EACCES);
         }
-
-        let system_full_path = fuse::system_full_path(&self.root, &obj.full_path);
-        debug!("system_full_path={}", system_full_path.display());
-        let file = match OpenOptions::new()
-            .write(true)
-            .open(system_full_path.clone())
-            .await
-        {
-            Ok(file) => file,
-            Err(_e) => return Err(libc::ENOENT),
-        };
-        debug!("opened {}", system_full_path.display());
-        file.set_len(new_length).await.unwrap();
 
         attrs.size = new_length;
         attrs.last_metadata_changed = SystemTime::now();
@@ -504,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_dir() {
+    async fn import_dir() {
         let tmp_dir = TempDir::new().expect("Could not create temp dir");
         let mut lis = setup_lis(&tmp_dir).await;
 
@@ -515,15 +513,15 @@ mod tests {
         let src_path = file.path();
         let dst_path = Path::new(file.path().file_name().unwrap());
 
-        lis.put(src_path, dst_path)
+        lis.import_file(src_path, dst_path)
             .await
-            .expect("Could not put file"); // should succeed
-        let get_content = lis.get_file(dst_path).await.expect("Could not get file"); // should succeed
+            .expect("Could not import file"); // should succeed
+        let get_content = lis.read(dst_path).await.expect("Could not get file"); // should succeed
         assert_eq!(get_content, content);
     }
 
     #[tokio::test]
-    async fn double_put() {
+    async fn import_file_twice() {
         let tmp_dir = TempDir::new().expect("Could not create temp dir");
         let mut lis = setup_lis(&tmp_dir).await;
 
@@ -534,20 +532,20 @@ mod tests {
         let binding = file.path().to_path_buf();
         let dst_path = Path::new(binding.file_name().unwrap());
 
-        // put file twice
-        lis.put(file.path(), dst_path)
+        // import file twice
+        lis.import_file(file.path(), dst_path)
             .await
-            .expect("Could not put file"); // should succeed
+            .expect("Could not import file"); // should succeed
 
         // but second time has more content
         let more_content = " more";
         write!(file, "{}", more_content).expect("Could not write to named temp file");
 
-        lis.put(file.path(), dst_path)
+        lis.import_file(file.path(), dst_path)
             .await
-            .expect("Could not put file");
+            .expect("Could not import file");
 
-        let get_content = lis.get_file(dst_path).await.expect("Could not get file"); // should succeed
+        let get_content = lis.read(dst_path).await.expect("Could not get file"); // should succeed
 
         let files = lis.list(Path::new("/")).await.expect("Could not get file"); // should succeed
 
@@ -556,7 +554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_file() {
+    async fn import_file() {
         let tmp_dir = TempDir::new().expect("Could not create temp dir");
         let mut lis = setup_lis(&tmp_dir).await;
 
@@ -568,19 +566,18 @@ mod tests {
         let binding = file.path().to_path_buf();
         let dst_path = Path::new(binding.file_name().unwrap());
 
-        // put file twice
-        lis.put(file.path(), dst_path)
+        lis.import_file(file.path(), dst_path)
             .await
-            .expect("Could not put file");
+            .expect("Could not import file");
 
         // but second time has more content
         let more_content = " more";
         write!(file, "{}", more_content).expect("Could not write to named temp file");
-        lis.put(file.path(), dst_path)
+        lis.import_file(file.path(), dst_path)
             .await
-            .expect("Could not put file");
+            .expect("Could not import file");
 
-        let get_content = lis.get_file(dst_path).await.expect("Could not get file"); // should succeed
+        let get_content = lis.read(dst_path).await.expect("Could not get file"); // should succeed
 
         let files = lis.list(Path::new("/")).await.expect("Could not get file"); // should succeed
 
@@ -624,17 +621,17 @@ mod tests {
         let src_path = file.path();
         let dst_path = Path::new("/1/2/3").join(file.path().file_name().unwrap());
 
-        // put file twice
-        lis.put(src_path, &dst_path)
+        // import file twice
+        lis.import_file(src_path, &dst_path)
             .await
-            .expect("Could not put file");
+            .expect("Could not import file");
 
         // check if file was created in path
         let files = lis.list(Path::new("/1/2/3")).await.unwrap(); // should succeed
         assert_eq!(files.len(), 1); // there should be exactly one file
 
         // retrieve content from the file
-        let get_content = lis.get_file(&dst_path).await.unwrap(); // should succeed
+        let get_content = lis.read(&dst_path).await.unwrap(); // should succeed
         assert_eq!(get_content, "Brian was here. Briefly."); // new content should be there
     }
 
@@ -650,7 +647,7 @@ mod tests {
             .unwrap();
 
         // retrieve content from the file (should be b"null")
-        let get_content = lis.get_file(file_path).await.unwrap();
+        let get_content = lis.read(file_path).await.unwrap();
         assert_eq!(get_content, "null");
     }
 }

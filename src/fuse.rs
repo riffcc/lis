@@ -13,13 +13,13 @@ use std::{
 use fuser::TimeOrNow;
 use fuser::TimeOrNow::Now;
 use tokio::{
-    fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
+    fs::File,
+    io::{AsyncBufReadExt, BufReader},
 };
 
 use crate::{
     prelude::*,
-    util::{key_from_file, key_to_string, rm_leading_slash},
+    util::{key_from_file, key_to_string},
 };
 
 impl fuser::Filesystem for Lis {
@@ -278,7 +278,7 @@ impl fuser::Filesystem for Lis {
     ) {
         let handle = self.rt.clone();
 
-        debug!("setattr(ino={ino}, size={size})");
+        debug!("setattr(ino={ino})");
         let mut attrs = match self.manifest.objects.get(&ino) {
             Some(obj) => obj.attrs.clone(),
             None => {
@@ -464,48 +464,6 @@ impl fuser::Filesystem for Lis {
                 error!("{e}");
                 reply.error(libc::ENOENT);
             }
-        }
-    }
-
-    fn fallocate(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        length: i64,
-        mode: i32,
-        reply: fuser::ReplyEmpty,
-    ) {
-        let handle = self.rt.clone();
-
-        let (path, mut attrs) = match self.manifest.objects.get(&ino) {
-            Some(obj) => (obj.full_path.to_path_buf(), obj.attrs.clone()),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        if let Ok(file) = handle.block_on(OpenOptions::new().write(true).open(path)) {
-            unsafe {
-                libc::fallocate64(file.as_raw_fd(), mode, offset, length);
-            }
-            if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
-                attrs.last_metadata_changed = SystemTime::now();
-                attrs.last_modified = SystemTime::now();
-                if (offset + length) as u64 > attrs.size {
-                    attrs.size = (offset + length) as u64;
-                }
-                if let Err(e) = self.write_inode(&attrs) {
-                    error!("{e}");
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-            }
-            reply.ok();
-        } else {
-            reply.error(libc::ENOENT);
         }
     }
 
@@ -746,7 +704,7 @@ impl fuser::Filesystem for Lis {
         };
 
         let offset = offset as usize;
-        match handle.block_on(self.get_file(&path)) {
+        match handle.block_on(self.read(&path)) {
             Ok(bytes_content) => {
                 let content_size = bytes_content.len();
                 let read_size: usize =
@@ -775,35 +733,35 @@ impl fuser::Filesystem for Lis {
     ) {
         let handle = self.rt.clone();
 
-        debug!("write() called with {:?} size={:?}", ino, data.len());
+        debug!("write(ino={ino}, size={:?})", data.len());
         assert!(offset >= 0);
         if !check_file_handle_write(fh) {
             reply.error(libc::EACCES);
             return;
         }
 
-        let (obj, path) = match self.manifest.objects.get(&ino) {
-            Some(obj) => (obj, obj.full_path.clone()),
+        let (mut attrs, full_path) = match self.manifest.objects.get(&ino) {
+            Some(obj) => (obj.attrs.clone(), obj.full_path.clone()),
             None => {
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        let full_path = system_full_path(&self.root, &path);
-        if let Ok(mut file) = handle.block_on(OpenOptions::new().write(true).open(full_path)) {
-            handle
-                .block_on(file.seek(SeekFrom::Start(offset as u64)))
-                .unwrap();
-            handle.block_on(file.write_all(data)).unwrap();
-
-            let mut attrs = obj.attrs.clone();
+        // save data to lis
+        if handle
+            .block_on(self.write(&full_path, data, offset as usize))
+            .is_ok()
+        {
+            // update attributes
             attrs.last_metadata_changed = SystemTime::now();
             attrs.last_modified = SystemTime::now();
             if data.len() + offset as usize > attrs.size as usize {
                 attrs.size = (data.len() + offset as usize) as u64;
             }
+
             clear_suid_sgid(&mut attrs);
+
             if let Err(e) = self.write_inode(&attrs) {
                 error!("Could not write: {e}");
                 reply.error(libc::ENOENT);
@@ -921,11 +879,6 @@ async fn get_groups(pid: u32) -> Vec<u32> {
     }
 
     vec![]
-}
-
-pub fn system_full_path(mountpoint: &Path, relpath: &Path) -> PathBuf {
-    //remove possible leading / from relpath
-    mountpoint.join(rm_leading_slash(relpath))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

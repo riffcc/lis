@@ -34,12 +34,12 @@ async fn main() -> Result<()> {
     let mut lis = Lis::new(&cli.root, cli.overwrite).await?;
 
     match &cli.command {
-        Commands::Put { paths } => {
+        Commands::ImportFile { paths } => {
             for path in paths {
                 info!(
                     "Added {} (keys: {:#?})",
                     path.display(),
-                    lis.put(path.as_path(), Path::new(path.file_name().unwrap()))
+                    lis.import_file(path.as_path(), Path::new(path.file_name().unwrap()))
                         .await?
                 );
             }
@@ -64,9 +64,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Get { paths } => {
+        Commands::Read { paths } => {
             for path in paths {
-                let content = lis.get_file(path.as_path()).await?;
+                let content = lis.read(path.as_path()).await?;
                 // Convert to &str
                 let ascii_content = std::str::from_utf8(&content)?;
                 println!("{}\n\n{}", path.display(), ascii_content);

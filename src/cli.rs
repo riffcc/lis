@@ -30,18 +30,18 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Puts files into node
+    /// Imports existing files into node
     /// Paths that don't exist or aren't accessible are ignored
-    Put { paths: Vec<PathBuf> },
+    ImportFile { paths: Vec<PathBuf> },
     /// Creates new top-level directory (e.g. `/foo` or `/bar`)
     Mkdir { path: PathBuf },
     /// List files on filesystem
     /// Paths that don't exist or aren't accessible are ignored
     #[command(alias = "ls")]
     List { path: Option<PathBuf> },
-    /// Gets files that are not currently locally accessible
+    /// Reads files that are not currently locally accessible
     /// Paths that don't exist or aren't accessible are ignored
-    Get { paths: Vec<PathBuf> },
+    Read { paths: Vec<PathBuf> },
     /// Removes files or dirs to filesystem
     /// Paths that don't exist or aren't accessible are ignored
     Rm { paths: Vec<PathBuf> },
