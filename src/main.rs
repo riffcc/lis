@@ -78,6 +78,12 @@ async fn main() -> Result<()> {
                 println!("Removed {}", path.display());
             }
         }
+        Commands::Rmdir { paths } => {
+            for path in paths {
+                let _ = lis.rmdir(path).await?;
+                println!("Removed {}", path.display());
+            }
+        }
         Commands::Join { ticket } => {
             lis.join(ticket)?;
 

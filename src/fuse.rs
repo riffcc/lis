@@ -661,6 +661,87 @@ impl fuser::Filesystem for Lis {
         }
     }
 
+    fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        debug!("rmdir(parent={parent}, name={:#?}", name);
+
+        let handle = self.rt.clone();
+
+        let full_path = self
+            .get_full_path(parent, name)
+            .expect("could not get full file name");
+
+        let mut attrs = match self.obj_from_path(&full_path) {
+            Some(obj) => obj.attrs.clone(),
+            None => {
+                error!("Could not find newly created dir {}", full_path.display());
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let mut parent_attrs = match self.manifest.objects.get(&parent) {
+            Some(obj) => obj.attrs.clone(),
+            None => {
+                error!("Could not find inode {parent}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // lis rmdir
+        // TODO: other error type for when trying to rm root dir
+        if let Err(e) = handle.block_on(self.rmdir(&full_path)) {
+            error!("Unable to rmdir {}: {e}", full_path.display());
+            reply.error(libc::ENOTEMPTY);
+            return;
+        }
+
+        if !check_access(
+            parent_attrs.uid,
+            parent_attrs.gid,
+            parent_attrs.mode,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        ) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        // "Sticky bit" handling
+        if parent_attrs.mode & libc::S_ISVTX as u16 != 0
+            && req.uid() != 0
+            && req.uid() != parent_attrs.uid
+            && req.uid() != attrs.uid
+        {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        parent_attrs.last_metadata_changed = SystemTime::now();
+        parent_attrs.last_modified = SystemTime::now();
+        if let Err(e) = self.write_inode(&parent_attrs) {
+            error!("Could not create dir {}: {e}", full_path.display());
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        attrs.hardlinks = 0;
+        attrs.last_metadata_changed = SystemTime::now();
+        if let Err(e) = self.write_inode(&attrs) {
+            error!("Could not create dir {}: {e}", full_path.display());
+            reply.error(libc::ENOENT);
+            return;
+        }
+        if let Err(e) = self.gc_inode(&attrs) {
+            error!("{e}");
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        reply.ok();
+    }
+
     fn mkdir(
         &mut self,
         req: &Request,
@@ -670,7 +751,7 @@ impl fuser::Filesystem for Lis {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        debug!("mkdir() called with {:?} {:?} {:o}", parent, name, mode);
+        debug!("mkdir(parent={parent}, name={:#?}, mode={:o})", name, mode);
         let handle = self.rt.clone();
 
         let (mut parent_attrs, parent_path) = match self.manifest.objects.get(&parent) {

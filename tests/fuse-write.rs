@@ -5,7 +5,7 @@ use std::{
 
 use tempfile::TempDir;
 use tokio::{
-    fs::{self, create_dir_all, remove_file, DirEntry, File},
+    fs::{self, create_dir_all, remove_dir, remove_file, DirEntry, File},
     io::AsyncWriteExt,
     time::sleep,
 };
@@ -62,6 +62,54 @@ async fn test_mkdir() {
         entries_2.push(entry);
     }
     assert_eq!(0, entries_2.len());
+}
+
+#[tokio::test]
+async fn test_rmdir() {
+    // Setup Lis
+    let tmp_root = TempDir::new().expect("Could not create temp dir");
+    let lis = setup_lis(&tmp_root).await;
+
+    // Mount Lis
+    let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");
+    let _handle = fuser::spawn_mount2(lis, &tmp_mountpoint, &[]).expect("could not mount Lis");
+
+    let mountpoint = tmp_mountpoint.path().to_path_buf();
+
+    let path = mountpoint.join("1").join("2");
+    create_dir_all(path)
+        .await
+        .expect("Failed to create directories");
+
+    let mountpoint = tmp_mountpoint.path().to_path_buf();
+
+    let path_1 = mountpoint.join("1");
+    let path_2 = mountpoint.join("1").join("2");
+
+    let mut entries_mountpoint: Vec<DirEntry> = Vec::new();
+    let mut entries = fs::read_dir(mountpoint).await.unwrap();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        entries_mountpoint.push(entry);
+    }
+    assert_eq!(1, entries_mountpoint.len());
+
+    let mut entries_1: Vec<DirEntry> = Vec::new();
+    entries = fs::read_dir(path_1.clone()).await.unwrap();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        entries_1.push(entry);
+    }
+    assert_eq!(1, entries_1.len());
+
+    // rm /1/2
+    remove_dir(path_2).await.unwrap();
+
+    // check that /1/2 is no longer inside /1
+    let mut entries_1: Vec<DirEntry> = Vec::new();
+    entries = fs::read_dir(path_1).await.unwrap();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        entries_1.push(entry);
+    }
+    assert_eq!(0, entries_1.len());
 }
 
 #[tokio::test]

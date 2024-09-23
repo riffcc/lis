@@ -42,9 +42,12 @@ pub enum Commands {
     /// Reads files that are not currently locally accessible
     /// Paths that don't exist or aren't accessible are ignored
     Read { paths: Vec<PathBuf> },
-    /// Removes files or dirs to filesystem
+    /// Removes files in filesystem
     /// Paths that don't exist or aren't accessible are ignored
     Rm { paths: Vec<PathBuf> },
+    /// Removes dirs in filesystem
+    /// Paths that don't exist or aren't accessible are ignored
+    Rmdir { paths: Vec<PathBuf> },
     /// Joins a network using the given ticket
     Join { ticket: NodeTicket },
     /// Generates a ticket for joining a network with Join

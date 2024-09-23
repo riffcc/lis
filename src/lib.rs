@@ -411,6 +411,34 @@ impl Lis {
         Ok(doc.id())
     }
 
+    pub async fn rmdir(&mut self, full_path: &PathBuf) -> Result<()> {
+        if *full_path == PathBuf::from("/") {
+            return Err(anyhow!("Cannot delete root dir"));
+        }
+
+        let doc = self.find_dir_doc(&full_path).await?;
+
+        // only delete empty directories
+        let query = Query::all().build();
+        if doc.get_many(query).await?.collect::<Vec<_>>().await.len() != 0 {
+            return Err(anyhow!("Directory not empty"));
+        }
+
+        self.iroh_node.docs().drop_doc(doc.id()).await?;
+        debug!("Removed directory {}", full_path.display());
+
+        // also remove entry in parent dir (if any)
+        let (parent_doc, key) = self.doc_and_key(&full_path).await?;
+        let query = Query::key_exact(key.clone());
+        if parent_doc.get_one(query).await?.is_some() {
+            parent_doc
+                .del(self.iroh_node.authors().default().await?, key.clone())
+                .await?; // delete old entry
+        }
+
+        Ok(())
+    }
+
     async fn find_dir_doc(&self, full_path: &PathBuf) -> Result<Doc> {
         // strip leading / from path
         let mut path = full_path.clone();
@@ -614,27 +642,23 @@ mod tests {
         let content = "Brian was here. Briefly.";
         write!(file, "{}", content).unwrap();
 
-        // create dir structure
-        // check if 1 was created in /
+        // create /1
         lis.mkdir(&Path::new("/1").to_path_buf(), None, None, None)
             .await
             .unwrap();
-        let entries = lis.list(Path::new("/")).await.unwrap(); // should succeed
-        assert_eq!(entries.len(), 1); // there should only be one dir
+        assert_eq!(lis.list(Path::new("/")).await.unwrap().len(), 1);
 
-        // check if 2 was created in /1
+        // create /1/2
         lis.mkdir(&Path::new("/1/2").to_path_buf(), None, None, None)
             .await
             .unwrap();
-        let entries = lis.list(Path::new("/1")).await.unwrap(); // should succeed
-        assert_eq!(entries.len(), 1); // there should only be one dir
+        assert_eq!(lis.list(Path::new("/1")).await.unwrap().len(), 1);
 
-        // check if 3 was created in /1/2
+        // create /1/2/3
         lis.mkdir(&Path::new("/1/2/3").to_path_buf(), None, None, None)
             .await
             .unwrap();
-        let entries = lis.list(Path::new("/1/2")).await.unwrap(); // should succeed
-        assert_eq!(entries.len(), 1); // there should only be one dir
+        assert_eq!(lis.list(Path::new("/1/2")).await.unwrap().len(), 1);
 
         // add file /1/2/3/myfile.txt
         let src_path = file.path();
@@ -652,6 +676,44 @@ mod tests {
         // retrieve content from the file
         let get_content = lis.read(&dst_path).await.unwrap(); // should succeed
         assert_eq!(get_content, "Brian was here. Briefly."); // new content should be there
+    }
+
+    #[tokio::test]
+    async fn rmdir() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut lis = setup_lis(&tmp_dir).await;
+
+        // Create a file inside of `env::temp_dir()`.
+        let mut file = NamedTempFile::new_in("/tmp/").unwrap();
+        let content = "Brian was here. Briefly.";
+        write!(file, "{}", content).unwrap();
+
+        // create /1
+        lis.mkdir(&Path::new("/1").to_path_buf(), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(lis.list(Path::new("/")).await.unwrap().len(), 1);
+
+        // create /1/2
+        lis.mkdir(&Path::new("/1/2").to_path_buf(), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(lis.list(Path::new("/1")).await.unwrap().len(), 1);
+
+        // rmdir /1/2
+        lis.rmdir(&Path::new("/1/2").to_path_buf()).await.unwrap();
+        assert_eq!(lis.list(Path::new("/1")).await.unwrap().len(), 0);
+
+        // rmdir /1
+        lis.rmdir(&Path::new("/1").to_path_buf()).await.unwrap();
+        assert_eq!(lis.list(Path::new("/")).await.unwrap().len(), 0);
+
+        // rmdir / (should fail)
+        let should_be_err = lis.rmdir(&Path::new("/").to_path_buf()).await;
+        assert!(should_be_err.is_err());
+        if let Err(e) = should_be_err {
+            assert_eq!(e.to_string(), "Cannot delete root dir");
+        }
     }
 
     #[tokio::test]
