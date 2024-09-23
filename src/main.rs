@@ -74,8 +74,8 @@ async fn main() -> Result<()> {
         }
         Commands::Rm { paths } => {
             for path in paths {
-                let key = lis.rm_file(path.as_path()).await?;
-                println!("Removed {key}");
+                let _ = lis.remove(path.as_path()).await?;
+                println!("Removed {}", path.display());
             }
         }
         Commands::Join { ticket } => {

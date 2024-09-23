@@ -258,6 +258,87 @@ impl fuser::Filesystem for Lis {
         );
     }
 
+    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        debug!("unlink(parent={parent}, name={:#?}", name);
+
+        let handle = self.rt.clone();
+
+        let mut parent_attrs = match self.manifest.objects.get(&parent) {
+            Some(obj) => obj.attrs.clone(),
+            None => {
+                error!("Could not find inode {parent}");
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let full_path = self
+            .get_full_path(parent, name)
+            .expect("could not get full file name");
+
+        let mut attrs = match self.obj_from_path(&full_path) {
+            Some(obj) => obj.attrs.clone(),
+            None => {
+                error!("Could not find newly created dir {}", full_path.display());
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        if !check_access(
+            parent_attrs.uid,
+            parent_attrs.gid,
+            parent_attrs.mode,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        ) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        let uid = req.uid();
+        // "Sticky bit" handling
+        if parent_attrs.mode & libc::S_ISVTX as u16 != 0
+            && uid != 0
+            && uid != parent_attrs.uid
+            && uid != attrs.uid
+        {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        if handle.block_on(self.remove(&full_path)).is_err() {
+            error!("Could not remove from lis");
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        parent_attrs.last_metadata_changed = SystemTime::now();
+        parent_attrs.last_modified = SystemTime::now();
+        if let Err(e) = self.write_inode(&parent_attrs) {
+            error!("{e}");
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        attrs.hardlinks -= 1;
+        attrs.last_metadata_changed = SystemTime::now();
+        if let Err(e) = self.write_inode(&attrs) {
+            error!("{e}");
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        if let Err(e) = self.gc_inode(&attrs) {
+            error!("{e}");
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        reply.ok();
+    }
+
     fn setattr(
         &mut self,
         req: &Request,

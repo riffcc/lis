@@ -313,13 +313,32 @@ impl Lis {
     }
 
     /// Remove a file
-    pub async fn rm_file(&mut self, path: &Path) -> Result<String> {
-        let key = key_from_file(Path::new(""), path)?;
+    pub async fn remove(&mut self, full_path: &Path) -> Result<()> {
+        let (doc, key) = self.doc_and_key(full_path).await?;
 
-        self.root_doc
-            .del(self.iroh_node.authors().default().await?, key.clone())
+        doc.del(self.iroh_node.authors().default().await?, key.clone())
             .await?;
-        key_to_string(key)
+
+        Ok(())
+    }
+
+    // Check whether a file should be removed from storage. Should be called after decrementing
+    // the link count, or closing a file handle
+    fn gc_inode(&mut self, attrs: &InodeAttributes) -> Result<()> {
+        if attrs.hardlinks > 0 || attrs.open_file_handles > 0 {
+            return Ok(());
+        }
+
+        // remove from objects
+        if let Some(obj) = self.manifest.objects.remove(&attrs.inode) {
+            let full_path = obj.full_path.clone();
+            if let Some(_ino) = self.manifest.inodes.remove(&full_path) {
+                self.manifest.save()?;
+            }
+            Ok(())
+        } else {
+            Err(anyhow!("Inode not found"))
+        }
     }
 
     /// Get contents of a file
@@ -649,5 +668,47 @@ mod tests {
         // retrieve content from the file (should be b"null")
         let get_content = lis.read(file_path).await.unwrap();
         assert_eq!(get_content, "null");
+    }
+
+    #[tokio::test]
+    async fn write() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut lis = setup_lis(&tmp_dir).await;
+
+        // Create empty file (touch) in lis
+        let file_path = Path::new("/myfile.txt");
+        lis.touch(&file_path.to_path_buf(), None, None, None)
+            .await
+            .unwrap();
+
+        // retrieve content from the file (should be b"null")
+        assert_eq!(lis.read(file_path).await.unwrap(), "null");
+
+        // write to file
+        lis.write(file_path, b"new data", 0).await.unwrap();
+
+        // ensure new content is there
+        assert_eq!(lis.read(file_path).await.unwrap(), "new data");
+    }
+
+    #[tokio::test]
+    async fn remove() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut lis = setup_lis(&tmp_dir).await;
+
+        // Create empty file (touch) in lis
+        let file_path = Path::new("/myfile.txt");
+        lis.touch(&file_path.to_path_buf(), None, None, None)
+            .await
+            .unwrap();
+
+        // retrieve content from the file (should be b"null")
+        assert_eq!(lis.read(file_path).await.unwrap(), "null");
+
+        // remove file
+        let _ = lis.remove(file_path).await.unwrap();
+
+        // ensure file no longer exists
+        assert_eq!(lis.list(Path::new("/")).await.unwrap().len(), 0);
     }
 }

@@ -1,9 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use tempfile::TempDir;
 use tokio::{
-    fs::{self, create_dir_all, DirEntry, File},
+    fs::{self, create_dir_all, remove_file, DirEntry, File},
     io::AsyncWriteExt,
+    time::sleep,
 };
 
 use lis::Lis;
@@ -110,10 +114,35 @@ async fn test_write() {
 
     // open and write to path
     let mut file = File::create(&path).await.unwrap();
-    file.write_all(b"hello from test_write").await.unwrap();
+    assert!(file.write_all(b"hello from test_write").await.is_ok());
+
+    // Add delay to allow time for file system to reflect removal
+    sleep(Duration::from_millis(50)).await;
 
     let contents = fs::read_to_string(&path)
         .await
         .expect("Could not read file");
     assert_eq!(contents, "hello from test_write");
+}
+
+#[tokio::test]
+async fn test_rm() {
+    // Setup Lis
+    let tmp_root = TempDir::new().expect("Could not create temp dir");
+    let lis = setup_lis(&tmp_root).await;
+
+    // Mount Lis
+    let tmp_mountpoint = TempDir::new().expect("Could not create temp dir");
+    let _handle = fuser::spawn_mount2(lis, &tmp_mountpoint, &[]).expect("could not mount Lis");
+
+    let mountpoint = tmp_mountpoint.path().to_path_buf();
+
+    let path = mountpoint.join(Path::new("foo.txt"));
+
+    // open and write to path
+    let mut file = File::create(&path).await.unwrap();
+    assert!(file.write_all(b"hello from test_rm").await.is_ok());
+
+    // remove file
+    assert!(remove_file(&path).await.is_ok());
 }
