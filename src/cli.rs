@@ -30,6 +30,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Creates empty file
+    Touch { path: PathBuf },
     /// Imports existing files into node
     /// Paths that don't exist or aren't accessible are ignored
     ImportFile { paths: Vec<PathBuf> },

@@ -5,6 +5,8 @@ pub use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub use iroh::node::Node;
+
 pub use anyhow::{anyhow, Result};
 #[allow(unused)]
 pub use fuser::{
@@ -14,11 +16,9 @@ pub use fuser::{
 #[allow(unused)]
 pub use log::{debug, error, info, warn, LevelFilter};
 pub use serde::{Deserialize, Serialize};
+pub use tokio::{fs::File, io::AsyncReadExt, io::AsyncWriteExt};
 
 pub use crate::Lis;
-
-pub type Inode = u64;
-pub type FileHandle = u64;
 
 pub const BLOCK_SIZE: u64 = 512;
 pub const MAX_NAME_LENGTH: u32 = 255;
