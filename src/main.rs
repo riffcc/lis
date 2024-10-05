@@ -23,11 +23,11 @@ async fn main() -> Result<()> {
     log_builder.filter(None, log::LevelFilter::Off);
     log_builder.init();
 
-    let _lis = Lis::new(&cli.root, cli.overwrite).await?;
+    let mut lis = Lis::new(&cli.root, cli.overwrite).await?;
 
     match &cli.command {
         Commands::Touch { path: _ } => {}
-        Commands::Mkdir { path: _ } => {}
+        Commands::Mkdir { path: PathBuf } => lis.create_dir(&path),
         Commands::List { path: _ } => {}
         Commands::ImportFile { paths: _ } => {}
         Commands::Read { paths: _ } => {}

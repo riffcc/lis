@@ -5,7 +5,7 @@ pub use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub use iroh::node::Node;
+pub use iroh::{blobs::store::fs::Store, client::Doc, docs::NamespaceId, node::Node};
 
 pub use anyhow::{anyhow, Result};
 #[allow(unused)]

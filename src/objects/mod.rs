@@ -1,28 +1,40 @@
 use crate::prelude::*;
 
+mod children;
+use children::Children;
+
+pub mod metadata;
+use metadata::Metadata;
+
 pub mod file;
+use file::LisFile;
 
 pub mod dir;
-use dir::Dir;
+use dir::LisDir;
 
 pub mod inode;
 use inode::InodeMap;
 
+pub enum ObjectType {
+    File(LisFile),
+    Dir(LisDir),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Root {
-    dir: Dir,
+pub struct LisRoot {
+    dir: LisDir,
     inode_map: InodeMap,
 }
 
-impl Root {
+impl LisRoot {
     pub async fn load(iroh_dir: &Path) -> Result<Self> {
         let root_path = iroh_dir.join(Path::new(".ROOT"));
         match root_path.exists() {
             false => {
                 let node = Node::persistent(iroh_dir).await?.spawn().await?;
 
-                let root = Root {
-                    dir: Dir::new(node.clone(), Path::new("/")).await?,
+                let root = Self {
+                    dir: LisDir::new(node.clone()).await?,
                     inode_map: InodeMap::new(node).await?,
                 };
 
@@ -38,10 +50,19 @@ impl Root {
                 let mut file = File::open(root_path).await?;
                 let mut content = String::new();
                 file.read_to_string(&mut content).await?;
-                let root: Root = serde_json::from_str(&content).unwrap();
+                let root: Self = serde_json::from_str(&content).unwrap();
 
                 Ok(root)
             }
         }
     }
+
+    pub async fn find(&self, full_path: &Path) -> Result<Option<ObjectType>> {
+        self.dir.find(full_path).await
+    }
+}
+
+pub trait FromNamespaceId {
+    // required methods
+    async fn from_namespace_id(node: Node<Store>, id: NamespaceId) -> Result<Self> {}
 }
