@@ -1,16 +1,10 @@
-use iroh::{
-    // client::docs::{Doc, Entry},
-    // docs::{store::Query, NamespaceId},
-    // net::ticket::NodeTicket,
-    node::Node,
-};
 use tokio::fs;
 
 pub mod prelude;
 use prelude::*;
 
 mod util;
-//use util::*;
+use util::get_relative_path;
 
 mod cli;
 pub use cli::{Cli, Commands};
@@ -20,7 +14,7 @@ use objects::{dir::LisDir, file::LisFile, LisRoot, ObjectType};
 
 pub struct Lis {
     pub iroh_node: Node<Store>,
-    iroh_dir: PathBuf,
+    _iroh_dir: PathBuf,
     pub rt: tokio::runtime::Handle,
     root: LisRoot,
 }
@@ -35,7 +29,7 @@ impl Lis {
     pub async fn new(iroh_dir: &Path, overwrite: bool) -> Result<Self> {
         if overwrite {
             // remove old root dir if one existed before
-            let _ = fs::remove_dir_all(iroh_dir);
+            let _ = fs::remove_dir_all(iroh_dir).await;
         }
         // create root if not exists
         fs::create_dir_all(iroh_dir).await?;
@@ -45,11 +39,11 @@ impl Lis {
             .spawn()
             .await?;
 
-        let root = LisRoot::load(iroh_dir).await?;
+        let root = LisRoot::load(iroh_node.client(), iroh_dir).await?;
 
         let lis = Lis {
             iroh_node,
-            iroh_dir: iroh_dir.to_path_buf(),
+            _iroh_dir: iroh_dir.to_path_buf(),
             rt: tokio::runtime::Handle::current(),
             root,
         };
@@ -69,34 +63,61 @@ impl Lis {
     //     Ok(())
     // }
 
+    // create /1/2
     pub async fn create_dir(&mut self, full_path: &Path) -> Result<()> {
-        match self.root.find(full_path).await? {
+        match self.root.find(self.iroh_node.client(), full_path).await? {
             Some(ObjectType::File(_file)) => return Err(anyhow!("Path is a file")),
             Some(ObjectType::Dir(_dir)) => return Err(anyhow!("Directory exists")),
             None => {}
         }
 
+        let parent_path = full_path.parent().ok_or(anyhow!("No parent for dir"))?;
         let mut parent_dir = match self
             .root
-            .find(full_path.parent().ok_or(anyhow!("No parent for dir"))?)
+            .find(self.iroh_node.client(), parent_path)
             .await?
-            .ok_or(anyhow!("No parent for dir"))?
-        {
+            .ok_or(anyhow!(
+                "Could not find doc for parent dir {}",
+                parent_path.display()
+            ))? {
             ObjectType::File(_file) => return Err(anyhow!("Parent is a file")),
             ObjectType::Dir(dir) => dir,
         };
 
-        let dir = LisDir::new(self.iroh_node.clone()).await?;
-        parent_dir.put_dir(dir).await?;
+        let relpath = get_relative_path(full_path, parent_path)
+            .ok_or(anyhow!("Could not find relative path"))?;
+
+        debug!(
+            "adding {}; parent={}({}); relpath={}",
+            full_path.display(),
+            parent_path.display(),
+            parent_dir.doc_id,
+            relpath.display()
+        );
+
+        let (dir, _dir_id) = LisDir::new(self.iroh_node.client()).await?;
+        parent_dir
+            .put_dir(self.iroh_node.client(), &relpath, dir)
+            .await?;
         Ok(())
+    }
+
+    pub async fn list(&self, full_path: &Path) -> Result<Vec<PathBuf>> {
+        let dir: LisDir = match self.root.find(self.iroh_node.client(), full_path).await? {
+            Some(ObjectType::Dir(dir)) => dir,
+            Some(ObjectType::File(_file)) => return Err(anyhow!("Path is a file")),
+            None => return Err(anyhow!("Path not found")),
+        };
+
+        dir.entries(&self.iroh_node.client()).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::{NamedTempFile, TempDir};
+    // use std::io::Write;
+    use tempfile::TempDir;
 
     async fn setup_lis(tmp_dir: &TempDir) -> Lis {
         let root = PathBuf::from(tmp_dir.path());
@@ -106,25 +127,29 @@ mod tests {
             .expect("Could not create new Lis node")
     }
     #[tokio::test]
-    async fn mkdir() {
+    async fn test_create_dir() {
         let tmp_dir = TempDir::new().unwrap();
         let mut lis = setup_lis(&tmp_dir).await;
 
-        // Create a file inside of `env::temp_dir()`.
-        let mut file = NamedTempFile::new_in("/tmp/").unwrap();
-        let content = "Brian was here. Briefly.";
-        write!(file, "{}", content).unwrap();
-
         // create /1
         lis.create_dir(&Path::new("/1")).await.unwrap();
-        assert_eq!(lis.list(Path::new("/")).await.unwrap().len(), 1);
+        let entries = lis.list(Path::new("/")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], Path::new("1"));
 
         // create /1/2
         lis.create_dir(&Path::new("/1/2")).await.unwrap();
-        assert_eq!(lis.list(Path::new("/1")).await.unwrap().len(), 1);
+        let entries = lis.list(Path::new("/1")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], Path::new("2"));
 
         // create /1/2/3
         lis.create_dir(&Path::new("/1/2/3")).await.unwrap();
-        assert_eq!(lis.list(Path::new("/1/2")).await.unwrap().len(), 1);
+        let entries = lis.list(Path::new("/1/2")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], Path::new("3"));
+
+        // create /1/2/3 (again, error: dir exists)
+        assert!(lis.create_dir(&Path::new("/1/2/3")).await.is_err());
     }
 }

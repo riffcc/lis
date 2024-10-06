@@ -4,7 +4,7 @@ use crate::prelude::*;
 pub struct InodeMap {}
 
 impl InodeMap {
-    pub async fn new(_node: Node<iroh::blobs::store::fs::Store>) -> Result<Self> {
+    pub async fn new(_node: &Iroh) -> Result<Self> {
         Ok(InodeMap {})
     }
 }

@@ -1,16 +1,15 @@
-use std::default;
+use std::path::Component;
 
-use iroh::{blobs::protocol::NonEmptyRequestRangeSpecIter, docs::NamespaceId};
+use iroh::docs::NamespaceId;
 
 use crate::{
     objects::{Children, FromNamespaceId, LisFile, Metadata, ObjectType},
     prelude::*,
-    util::{load_doc, namespace_id_to_bytes, split_path, DocId, DocType, Key},
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LisDir {
-    doc_id: NamespaceId,
+    pub doc_id: NamespaceId,
     children: Children,
     metadata: Metadata,
 }
@@ -21,26 +20,29 @@ struct DirEntry {
 }
 
 impl LisDir {
-    pub async fn new(node: Node<Store>) -> Result<(Self, NamespaceId)> {
-        let (children, children_id) = Children::new(node.clone()).await?;
-        let (metadata, metadata_id) = Metadata::new(node.clone()).await?;
-
-        let metadata_key = Key::from("metadata".to_string());
-        let children_key = Key::from("children".to_string());
+    pub async fn new(node: &Iroh) -> Result<(Self, NamespaceId)> {
+        let (children, children_id) = Children::new(&node.clone()).await?;
+        let (metadata, metadata_id) = Metadata::new(&node.clone()).await?;
 
         let doc = node.docs().create().await?;
-        // doc["metadata"] = metadata_id
         doc.set_bytes(
             node.authors().default().await?,
-            metadata_key,
+            Key::from("metadata".to_string()),
             namespace_id_to_bytes(metadata_id),
         )
         .await?;
-        // doc["children"] = children_id
         doc.set_bytes(
             node.authors().default().await?,
-            children_key,
+            Key::from("children".to_string()),
             namespace_id_to_bytes(children_id),
+        )
+        .await?;
+
+        // set type to "dir"
+        doc.set_bytes(
+            node.authors().default().await?,
+            Key::from(".type".to_string()),
+            Bytes::from("dir".to_string()),
         )
         .await?;
 
@@ -54,84 +56,76 @@ impl LisDir {
         ))
     }
 
-    pub async fn get(&self, node: Node<Store>, key_str: String) -> Result<Option<ObjectType>> {
-        if path.components().len() != 1 {
-            return Err(anyhow!("Wrong path type to get"));
-        }
-
-        let doc = load_doc(node, self.doc_id).await?;
-
-        let key = Key::from(key_str);
-
-        let query = Query::key_exact(key);
-        let entry = doc
-            .get_one(query)
-            .await?
-            .ok_or_else(|| anyhow!("entry not found"))?;
-
-        let content = entry.content_bytes(node.client()).await?;
+    pub async fn get(&self, node: &Iroh, path: PathBuf) -> Result<Option<ObjectType>> {
+        self.children.get(node, path).await
     }
 
-    pub async fn find(&self, path: &Path) -> Result<Option<ObjectType>> {
-        match split_path(path) {
-            Some((next, None)) => {
-                // base case: either here or not present
-                if let Some(entry) = self.children.get(node, next).await? {
-                    Ok(Some(entry))
-                } else {
-                    Ok(None)
+    pub async fn find(&self, node: &Iroh, path: &Path) -> Result<Option<ObjectType>> {
+        let mut cur_dir = LisDir::from_namespace_id(&node.clone(), self.doc_id).await?;
+        for component in path.components() {
+            match component {
+                Component::Normal(osstr) => {
+                    let cur_path = Path::new(osstr);
+                    debug!("cur_path={}", cur_path.display());
+                    match cur_dir.get(&node.clone(), cur_path.into()).await? {
+                        Some(ObjectType::Dir(next_dir)) => {
+                            cur_dir = next_dir;
+                        }
+                        Some(ObjectType::File(file)) => return Ok(Some(ObjectType::File(file))),
+                        None => return Ok(None),
+                    }
                 }
+                _ => return Err(anyhow!("Invalid component in path")),
             }
-            Some((next, Some(rest))) => {
-                // move on to next doc
-                if let Some(entry) = self.children.get(node, next).await? {
-                    let next_doc_id = DocId::from(entry);
-                    let next_doc = load_doc(node, next_doc_id).await?;
-                    next_doc.find(rest)
-                } else {
-                    Ok(None)
-                }
-            }
-            None => Err(anyhow!("Unexpected error while looking for object")),
         }
+        Ok(Some(ObjectType::Dir(cur_dir)))
     }
 
-    pub async fn put_dir(&mut self, dir: LisDir) -> Result<()> {
+    pub async fn put_dir(&mut self, node: &Iroh, path: &Path, dir: LisDir) -> Result<()> {
+        debug!("putting {}", path.display());
+        self.children.put(node, path.to_path_buf(), dir).await?;
         self.metadata.items += 1;
-        self.metadata.save().await?;
-        self.children.put(dir).await
+        self.metadata.save(&node).await
+    }
+
+    pub async fn entries(&self, node: &Iroh) -> Result<Vec<PathBuf>> {
+        self.children.entries(node).await
     }
 }
 
 impl FromNamespaceId for LisDir {
-    async fn from_namespace_id(node: Node<Store>, id: NamespaceId) -> Result<Self> {
-        let doc = load_doc(node, id).await?;
+    async fn from_namespace_id(node: &Iroh, id: NamespaceId) -> Result<Self> {
+        let doc = load_doc(&node, id).await?;
 
         // check type
-        if doc_type(node, doc) != DocType::DirDoc {
+        if doc_type(&node, &doc).await? != DocType::DirDoc {
             return Err(anyhow!("NamespaceId does not correspond to a dir doc"));
         }
 
         let default_author = node.authors().default().await?;
-        let children_key = Key::from("children".to_string());
-        let metadata_key = Key::from("metadata".to_string());
 
+        let children_key = Key::from("children".to_string());
         let children_id = bytes_to_namespace_id(
             doc.get_exact(default_author, children_key, false)
                 .await?
-                .ok_or(anyhow!("children entry not found"))?,
-        );
+                .ok_or(anyhow!("children not found"))?
+                .content_bytes(&node.clone())
+                .await?,
+        )?;
 
+        let metadata_key = Key::from("metadata".to_string());
         let metadata_id = bytes_to_namespace_id(
-            doc.get_exact(default_author, children_key, false)
+            doc.get_exact(default_author, metadata_key, false)
                 .await?
-                .ok_or(anyhow!("metadata not found"))?,
-        );
+                .ok_or(anyhow!("metadata not found"))?
+                .content_bytes(&node.clone())
+                .await?,
+        )?;
 
         Ok(Self {
             doc_id: id,
-            children: Children::from_namespace_id(node.clone(), children_id).await?,
-            metadata: Metadata::from_namespace_id(node.clone(), metadata_id).await?,
+            children: Children::from_namespace_id(&node, children_id).await?,
+            metadata: Metadata::from_namespace_id(&node, metadata_id).await?,
         })
     }
 }

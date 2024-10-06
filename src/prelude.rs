@@ -5,7 +5,14 @@ pub use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub use iroh::{blobs::store::fs::Store, client::Doc, docs::NamespaceId, node::Node};
+pub use iroh::{
+    blobs::store::fs::Store,
+    client::{Doc, Iroh},
+    docs::{store::Query, NamespaceId},
+    node::Node,
+};
+
+pub use bytes::Bytes;
 
 pub use anyhow::{anyhow, Result};
 #[allow(unused)]
@@ -18,6 +25,8 @@ pub use log::{debug, error, info, warn, LevelFilter};
 pub use serde::{Deserialize, Serialize};
 pub use tokio::{fs::File, io::AsyncReadExt, io::AsyncWriteExt};
 
+#[allow(unused)]
+pub use crate::util::*;
 pub use crate::Lis;
 
 pub const BLOCK_SIZE: u64 = 512;

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use clap::Parser;
 #[allow(unused)]
@@ -27,8 +29,15 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Touch { path: _ } => {}
-        Commands::Mkdir { path: PathBuf } => lis.create_dir(&path),
-        Commands::List { path: _ } => {}
+        Commands::Mkdir { path } => lis.create_dir(&path).await?,
+        Commands::List { path } => {
+            let paths = lis
+                .list(&path.clone().unwrap_or(Path::new("/").to_path_buf()))
+                .await?;
+            for path in paths {
+                println!("{}", path.display());
+            }
+        }
         Commands::ImportFile { paths: _ } => {}
         Commands::Read { paths: _ } => {}
         Commands::Rm { paths: _ } => {}

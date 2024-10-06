@@ -1,3 +1,8 @@
+- wrapper for dirs, files, metadata, children (object) (maybe two? one for dirs/files, one for all)
+- wrapper for Doc (get, set, etc)
+    - set type when creating new
+        - map string to ObjectType (doc_type)
+    - only one implementation of from_namespace_id
 - from::Doc for LisFile, LisDir
 - tests for from conversions in util.rs
 - tests for create_dir
