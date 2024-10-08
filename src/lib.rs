@@ -6,6 +6,8 @@ use prelude::*;
 mod util;
 use util::get_relative_path;
 
+mod doc;
+
 mod cli;
 pub use cli::{Cli, Commands};
 
@@ -91,7 +93,7 @@ impl Lis {
             "adding {}; parent={}({}); relpath={}",
             full_path.display(),
             parent_path.display(),
-            parent_dir.doc_id,
+            parent_dir.id(),
             relpath.display()
         );
 

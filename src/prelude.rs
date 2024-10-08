@@ -7,7 +7,7 @@ pub use std::{
 
 pub use iroh::{
     blobs::store::fs::Store,
-    client::{Doc, Iroh},
+    client::{docs::Entry, Doc, Iroh},
     docs::{store::Query, NamespaceId},
     node::Node,
 };
@@ -25,6 +25,7 @@ pub use log::{debug, error, info, warn, LevelFilter};
 pub use serde::{Deserialize, Serialize};
 pub use tokio::{fs::File, io::AsyncReadExt, io::AsyncWriteExt};
 
+pub use crate::doc::DocType;
 #[allow(unused)]
 pub use crate::util::*;
 pub use crate::Lis;

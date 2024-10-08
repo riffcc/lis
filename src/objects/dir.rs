@@ -3,13 +3,14 @@ use std::path::Component;
 use iroh::docs::NamespaceId;
 
 use crate::{
+    doc::LisDoc,
     objects::{Children, FromNamespaceId, LisFile, Metadata, ObjectType},
     prelude::*,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LisDir {
-    pub doc_id: NamespaceId,
+    doc: LisDoc,
     children: Children,
     metadata: Metadata,
 }
@@ -24,35 +25,30 @@ impl LisDir {
         let (children, children_id) = Children::new(&node.clone()).await?;
         let (metadata, metadata_id) = Metadata::new(&node.clone()).await?;
 
-        let doc = node.docs().create().await?;
-        doc.set_bytes(
-            node.authors().default().await?,
-            Key::from("metadata".to_string()),
+        let doc = LisDoc::new(node).await?;
+        doc.set(
+            node,
+            Key::from(".metadata".to_string()),
             namespace_id_to_bytes(metadata_id),
         )
         .await?;
-        doc.set_bytes(
-            node.authors().default().await?,
-            Key::from("children".to_string()),
+        doc.set(
+            node,
+            Key::from(".children".to_string()),
             namespace_id_to_bytes(children_id),
         )
         .await?;
+        doc.set(node, Key::from(".type".to_string()), "dir".into())
+            .await?;
 
-        // set type to "dir"
-        doc.set_bytes(
-            node.authors().default().await?,
-            Key::from(".type".to_string()),
-            Bytes::from("dir".to_string()),
-        )
-        .await?;
-
+        let id = doc.id();
         Ok((
             Self {
-                doc_id: doc.id(),
+                doc,
                 children,
                 metadata,
             },
-            doc.id(),
+            id,
         ))
     }
 
@@ -61,7 +57,7 @@ impl LisDir {
     }
 
     pub async fn find(&self, node: &Iroh, path: &Path) -> Result<Option<ObjectType>> {
-        let mut cur_dir = LisDir::from_namespace_id(&node.clone(), self.doc_id).await?;
+        let mut cur_dir = self.clone();
         for component in path.components() {
             match component {
                 Component::Normal(osstr) => {
@@ -81,9 +77,15 @@ impl LisDir {
         Ok(Some(ObjectType::Dir(cur_dir)))
     }
 
+    pub fn id(&self) -> NamespaceId {
+        self.doc.id()
+    }
+
     pub async fn put_dir(&mut self, node: &Iroh, path: &Path, dir: LisDir) -> Result<()> {
         debug!("putting {}", path.display());
-        self.children.put(node, path.to_path_buf(), dir).await?;
+        self.children
+            .put(node, path.to_path_buf(), dir.doc.id())
+            .await?;
         self.metadata.items += 1;
         self.metadata.save(&node).await
     }
@@ -95,37 +97,31 @@ impl LisDir {
 
 impl FromNamespaceId for LisDir {
     async fn from_namespace_id(node: &Iroh, id: NamespaceId) -> Result<Self> {
-        let doc = load_doc(&node, id).await?;
+        let doc = LisDoc::from_namespace_id(node, id).await?;
 
         // check type
-        if doc_type(&node, &doc).await? != DocType::DirDoc {
+        if doc.doc_type(node).await? != DocType::DirDoc {
             return Err(anyhow!("NamespaceId does not correspond to a dir doc"));
         }
 
-        let default_author = node.authors().default().await?;
-
-        let children_key = Key::from("children".to_string());
+        let children_key = Key::from(".children".to_string());
         let children_id = bytes_to_namespace_id(
-            doc.get_exact(default_author, children_key, false)
+            doc.get(node, children_key)
                 .await?
-                .ok_or(anyhow!("children not found"))?
-                .content_bytes(&node.clone())
-                .await?,
+                .ok_or(anyhow!("Could not find children key in dir doc"))?,
         )?;
 
-        let metadata_key = Key::from("metadata".to_string());
+        let metadata_key = Key::from(".metadata".to_string());
         let metadata_id = bytes_to_namespace_id(
-            doc.get_exact(default_author, metadata_key, false)
+            doc.get(node, metadata_key)
                 .await?
-                .ok_or(anyhow!("metadata not found"))?
-                .content_bytes(&node.clone())
-                .await?,
+                .ok_or(anyhow!("Could not find metadata key in dir doc"))?,
         )?;
 
         Ok(Self {
-            doc_id: id,
-            children: Children::from_namespace_id(&node, children_id).await?,
-            metadata: Metadata::from_namespace_id(&node, metadata_id).await?,
+            doc: LisDoc::new(&node.clone()).await?,
+            children: Children::from_namespace_id(&node.clone(), children_id).await?,
+            metadata: Metadata::from_namespace_id(&node.clone(), metadata_id).await?,
         })
     }
 }
