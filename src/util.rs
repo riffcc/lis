@@ -3,18 +3,8 @@ use std::str;
 
 use iroh::docs::NamespaceId;
 
+use crate::doc::LisDoc;
 use crate::prelude::*;
-
-#[derive(Debug, PartialEq)]
-pub enum DocType {
-    DirDoc,
-    ChildrenDoc,
-    MetadataDoc,
-    FileChunkDoc,
-    FileDoc,
-    RootDoc,
-    Unkown,
-}
 
 pub struct Key(Bytes);
 
@@ -67,13 +57,6 @@ impl From<NamespaceId> for Key {
     }
 }
 
-pub async fn load_doc(node: &Iroh, doc_id: NamespaceId) -> Result<Doc> {
-    node.docs()
-        .open(doc_id)
-        .await?
-        .ok_or(anyhow!("no files doc found"))
-}
-
 /// Converts NamespaceId to Bytes
 pub fn namespace_id_to_bytes(id: NamespaceId) -> Bytes {
     let byte_vec = id.to_bytes().to_vec();
@@ -94,30 +77,6 @@ pub fn get_relative_path(path: &Path, parent: &Path) -> Option<PathBuf> {
     } else {
         None // Return None if the parent is not a prefix of the path
     }
-}
-
-pub async fn doc_type(node: &Iroh, doc: &Doc) -> Result<DocType> {
-    let bytes: Bytes = match doc
-        .get_exact(
-            node.authors().default().await?,
-            &Key::from(".type".to_string()),
-            false,
-        )
-        .await?
-    {
-        Some(entry) => entry.content_bytes(&node.clone()).await?,
-        None => return Err(anyhow!("No doc type: '.type' key not present")),
-    };
-
-    Ok(match String::from_utf8(bytes.to_vec())?.as_ref() {
-        "root" => DocType::RootDoc,
-        "dir" => DocType::DirDoc,
-        "children" => DocType::ChildrenDoc,
-        "metadata" => DocType::MetadataDoc,
-        "file" => DocType::FileDoc,
-        "fileChunk" => DocType::FileChunkDoc,
-        _ => DocType::Unkown,
-    })
 }
 
 pub fn split_path(path: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
@@ -165,25 +124,6 @@ mod tests {
         assert_eq!(
             get_relative_path(Path::new("/a/b/c"), Path::new("/d")),
             None,
-        );
-    }
-
-    #[tokio::test]
-    async fn test_doc_type() {
-        let node = iroh::node::Node::memory().spawn().await.unwrap();
-        let doc = node.docs().create().await.unwrap();
-
-        // set type to "children"
-        doc.set_bytes(
-            node.authors().default().await.unwrap(),
-            Key::from(".type".to_string()),
-            Bytes::from("children".to_string()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            doc_type(node.client(), &doc).await.unwrap(),
-            DocType::ChildrenDoc
         );
     }
 }

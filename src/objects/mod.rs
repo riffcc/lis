@@ -64,13 +64,13 @@ impl LisRoot {
 
         // remove root from path
         let full_path_without_root: PathBuf = if !full_path.has_root() {
-            return Err(anyhow!("Path is not absolute (no root found)"));
+            return Err(anyhow!("Path is not absolute (does not start with /)"));
         } else {
             // remove root
             full_path.iter().skip(1).collect()
         };
         debug!(
-            "path for find (no root): {}",
+            "path for find (without root): {}",
             full_path_without_root.display()
         );
 
