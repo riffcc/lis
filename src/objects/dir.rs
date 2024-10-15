@@ -12,7 +12,7 @@ use crate::{
 pub struct LisDir {
     doc: LisDoc,
     children: Children,
-    metadata: Metadata,
+    metadata: Metadata<ObjectType::Dir>,
 }
 
 struct DirEntry {
@@ -87,7 +87,7 @@ impl LisDir {
         self.children
             .put(node, path.to_path_buf(), object_id)
             .await?;
-        self.metadata.items += 1;
+        self.metadata.attrs.items += 1;
         self.metadata.save(&node).await
     }
 
