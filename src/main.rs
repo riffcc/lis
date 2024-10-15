@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     let mut lis = Lis::new(&cli.root, cli.overwrite).await?;
 
     match &cli.command {
-        Commands::Touch { path: _ } => {}
+        Commands::Touch { path } => lis.create_file(&path).await?,
         Commands::Mkdir { path } => lis.create_dir(&path).await?,
         Commands::List { path } => {
             let paths = lis

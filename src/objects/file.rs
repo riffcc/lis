@@ -7,7 +7,7 @@ use crate::{
 pub struct LisFile {
     doc: LisDoc,
     chunks: Chunks,
-    metadata: Metadata,
+    metadata: Metadata<ObjectType::File>,
 }
 
 impl LisFile {
