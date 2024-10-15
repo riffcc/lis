@@ -81,10 +81,11 @@ impl LisDir {
         self.doc.id()
     }
 
-    pub async fn put_dir(&mut self, node: &Iroh, path: &Path, dir: LisDir) -> Result<()> {
+    /// Puts dir or file inside of current dir
+    pub async fn put(&mut self, node: &Iroh, path: &Path, object_id: NamespaceId) -> Result<()> {
         debug!("putting {}", path.display());
         self.children
-            .put(node, path.to_path_buf(), dir.doc.id())
+            .put(node, path.to_path_buf(), object_id)
             .await?;
         self.metadata.items += 1;
         self.metadata.save(&node).await

@@ -52,20 +52,44 @@ impl Lis {
         Ok(lis)
     }
 
-    // pub async fn create_file(&mut self, full_path: &Path) -> Result<()> {
-    //     match self.root.find(full_path).await {
-    //         Some(ObjectType::File(_file)) => return Err(anyhow!("File exists")),
-    //         Some(ObjectType::Dir(_dir)) => return Err(anyhow!("Is a directory")),
-    //         None => {}
-    //     }
-    //     // new LisFile
-    //     // find Dir where file is in
-    //     // if file already exists, error
-    //     // put file in dir
-    //     Ok(())
-    // }
+    pub async fn create_file(&mut self, full_path: &Path) -> Result<()> {
+        match self.root.find(self.iroh_node.client(), full_path).await? {
+            Some(ObjectType::File(_file)) => return Err(anyhow!("File exists")),
+            Some(ObjectType::Dir(_dir)) => return Err(anyhow!("Path is a directory")),
+            None => {}
+        }
 
-    // create /1/2
+        let parent_path = full_path.parent().ok_or(anyhow!("No parent for dir"))?;
+        let mut parent_dir = match self
+            .root
+            .find(self.iroh_node.client(), parent_path)
+            .await?
+            .ok_or(anyhow!(
+                "Could not find doc for parent dir {}",
+                parent_path.display()
+            ))? {
+            ObjectType::File(_file) => return Err(anyhow!("Parent is a file")),
+            ObjectType::Dir(dir) => dir,
+        };
+
+        let relpath = get_relative_path(full_path, parent_path)
+            .ok_or(anyhow!("Could not find relative path"))?;
+
+        debug!(
+            "adding {}; parent={}({}); relpath={}",
+            full_path.display(),
+            parent_path.display(),
+            parent_dir.id(),
+            relpath.display()
+        );
+
+        let (_file, file_id) = LisFile::new(self.iroh_node.client()).await?;
+        parent_dir
+            .put(self.iroh_node.client(), &relpath, file_id)
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_dir(&mut self, full_path: &Path) -> Result<()> {
         match self.root.find(self.iroh_node.client(), full_path).await? {
             Some(ObjectType::File(_file)) => return Err(anyhow!("Path is a file")),
@@ -97,9 +121,9 @@ impl Lis {
             relpath.display()
         );
 
-        let (dir, _dir_id) = LisDir::new(self.iroh_node.client()).await?;
+        let (_dir, dir_id) = LisDir::new(self.iroh_node.client()).await?;
         parent_dir
-            .put_dir(self.iroh_node.client(), &relpath, dir)
+            .put(self.iroh_node.client(), &relpath, dir_id)
             .await?;
         Ok(())
     }
@@ -153,5 +177,28 @@ mod tests {
 
         // create /1/2/3 (again, error: dir exists)
         assert!(lis.create_dir(&Path::new("/1/2/3")).await.is_err());
+    }
+    #[tokio::test]
+    async fn test_create_file() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut lis = setup_lis(&tmp_dir).await;
+
+        // create /file
+        lis.create_file(&Path::new("/file")).await.unwrap();
+        let entries = lis.list(Path::new("/")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], Path::new("file"));
+
+        // create /dir
+        lis.create_dir(&Path::new("/dir")).await.unwrap();
+
+        // create /dir/file
+        lis.create_file(&Path::new("/dir/file")).await.unwrap();
+        let entries = lis.list(Path::new("/dir")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], Path::new("file"));
+
+        // create /dir/file (again, error: file exists)
+        assert!(lis.create_file(&Path::new("/dir/file")).await.is_err());
     }
 }

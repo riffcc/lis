@@ -84,7 +84,7 @@ pub enum DocType {
     DirDoc,
     ChildrenDoc,
     MetadataDoc,
-    FileChunkDoc,
+    ChunksDoc,
     FileDoc,
     RootDoc,
     Unknown,
@@ -98,7 +98,7 @@ impl From<Bytes> for DocType {
             "children" => DocType::ChildrenDoc,
             "metadata" => DocType::MetadataDoc,
             "file" => DocType::FileDoc,
-            "fileChunk" => DocType::FileChunkDoc,
+            "chunks" => DocType::ChunksDoc,
             _ => DocType::Unknown,
         }
     }
