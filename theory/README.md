@@ -17,6 +17,19 @@ other Lis clusters, and to be able to easily migrate data between Lis clusters.
 * DHT compatibility
 * DNS-like node discovery
 
+## Architecture
+* S3-compliant API
+    * Lis is designed to be able to transparently store S3 objects.
+* FUSE-compatible userspace filesystem
+* Potential for a kernel driver later
+* Eventually consistent, except where strict consistency is required
+* Mostly stateless, no node needs to hold the only or even majority copy of any data
+* Automatically detects disks and type of disk (HDD, SSD, etc)
+* Automatically balances data across disks of different types
+* Tiering based on access frequency and other properties
+* Files are stored in a MerkleDAG that looks like this:
+
+
 ## What should using Lis look like?
 Most users will start with either running `lis` directly, or running `lis --help` to learn more about Lis.
 ```
@@ -62,18 +75,6 @@ Additional ReDB databases can be specified in the configuration file. If you spe
 │   ├── main.rs
 ├── Cargo.toml
 ├── Cargo.lock
-
-## Architecture
-* S3-compliant API
-    * Lis is designed to be able to transparently store S3 objects.
-* FUSE-compatible userspace filesystem
-* Potential for a kernel driver later
-* Eventually consistent, except where strict consistency is required
-* Mostly stateless, no node needs to hold the only or even majority copy of any data
-* Automatically detects disks and type of disk (HDD, SSD, etc)
-* Automatically balances data across disks of different types
-* Tiering based on access frequency and other properties
-* Files are stored in a MerkleDAG that looks like this:
 
 # Structure of the MerkleDAG
 Files and folders are stored in a MerkleDAG that looks like this:
