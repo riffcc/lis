@@ -1105,6 +1105,23 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
     
     // Initialize P2P networking
     app_state.init_p2p().await?;
+    
+    // Start listening on all interfaces
+    if let Some(swarm) = &app_state.swarm {
+        let mut swarm = swarm.lock().await;
+        // Listen on all interfaces
+        swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?)?;
+        // Also listen on localhost for local testing
+        swarm.listen_on(format!("/ip4/127.0.0.1/tcp/{}", DEFAULT_PORT).parse()?)?;
+        // Add some random ports for better connectivity
+        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+        
+        // Start a bootstrap process
+        println!("Starting DHT bootstrap...");
+        swarm.behaviour_mut().kademlia.bootstrap()?;
+    }
+    
     app_state.start_listening().await?;
     
     // Load all available clusters and their tickets
@@ -1175,8 +1192,12 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                     for cluster in &clusters {
                         let topic = format!("lis-cluster:{}", cluster);
                         println!("  - {} (announcing and searching)", cluster);
+                        // Announce ourselves as a provider
                         let _ = swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
+                        // Look for other providers
                         let _ = swarm.behaviour_mut().kademlia.get_providers(topic.as_bytes().to_vec().into());
+                        // Also bootstrap the DHT periodically to maintain connectivity
+                        let _ = swarm.behaviour_mut().kademlia.bootstrap();
                     }
                     println!("");
                 }
@@ -1269,6 +1290,9 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                                         let mut swarm = swarm.lock().await;
                                                                         if provider != *swarm.local_peer_id() {
                                                                             println!("Attempting to connect to provider");
+                                                                            // Try to find the provider in the DHT first
+                                                                            swarm.behaviour_mut().kademlia.get_closest_peers(provider);
+                                                                            // Also try direct dialing
                                                                             let _ = swarm.dial(provider);
                                                                         } else {
                                                                             println!("Skipping self-connection");
@@ -1285,6 +1309,9 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                                             let mut swarm = swarm.lock().await;
                                                                             if peer != *swarm.local_peer_id() {
                                                                                 println!("Attempting to connect to closest peer");
+                                                                                // Try to find the peer in the DHT first
+                                                                                swarm.behaviour_mut().kademlia.get_closest_peers(peer);
+                                                                                // Also try direct dialing
                                                                                 let _ = swarm.dial(peer);
                                                                             }
                                                                         }
