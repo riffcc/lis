@@ -264,14 +264,14 @@ impl AppState {
             kademlia: kad,
         };
 
-        // Create a Swarm
+        // Create a Swarm with noise encryption and yamux multiplexing
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
             .with_behaviour(|_| behaviour)?
             .build();
 
-        // Enable hole punching in the swarm
+        // Listen on the default port
         swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?)?;
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?; // Also listen on a random port for fallback
 
@@ -478,8 +478,36 @@ impl AppState {
                 swarm.behaviour_mut().kademlia.bootstrap()?;
             }
             
-            // Wait a bit for bootstrap to take effect
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Wait for bootstrap to complete (up to 30 seconds)
+            let mut bootstrap_complete = false;
+            let mut attempts = 0;
+            while !bootstrap_complete && attempts < 30 {
+                if let Some(swarm) = &self.swarm {
+                    let mut swarm = swarm.lock().await;
+                    if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                        match event {
+                            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Kademlia(
+                                libp2p::kad::Event::OutboundQueryProgressed { result: libp2p::kad::QueryResult::Bootstrap(_), .. }
+                            )) => {
+                                println!("Bootstrap completed successfully");
+                                bootstrap_complete = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !bootstrap_complete {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    attempts += 1;
+                    if attempts % 5 == 0 {
+                        println!("Waiting for bootstrap to complete... ({}/30)", attempts);
+                    }
+                }
+            }
+            
+            if !bootstrap_complete {
+                println!("Warning: Bootstrap did not complete in time, continuing anyway...");
+            }
             
             // Now try to find and connect to the host
             {
