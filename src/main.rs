@@ -495,7 +495,14 @@ fn print_help() {
 }
 
 fn unmount_fuse(mount_point: &Path) -> Result<()> {
-    mount::unmount(mount_point, MntFlags::empty())?;
+    #[cfg(target_os = "macos")]
+    {
+        mount::unmount(mount_point, MntFlags::empty())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        mount::umount(mount_point)?;
+    }
     Ok(())
 }
 
@@ -786,6 +793,7 @@ async fn run_unmount(config: Option<String>) -> Result<()> {
     let app_state = AppState::new(config)?;
     println!("Unmounting filesystem using config: {}", app_state.config_path.display());
     println!("Unmounting filesystem... (not fully implemented)");
+    unmount_fuse(&app_state.config_path)?;
     Ok(())
 }
 
