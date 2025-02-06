@@ -68,8 +68,8 @@ const ROOT_DOC_KEY: &str = "root";
 const NODE_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_PORT: u16 = 34163;
 const BOOTSTRAP_NODES: [&str; 2] = [
-    "/ip4/104.131.131.82/tcp/34163/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",  // libp2p bootstrap node
-    "/ip4/104.236.179.241/tcp/34163/p2p/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM", // libp2p bootstrap node
+    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",  // libp2p bootstrap node
+    "/ip4/104.236.179.241/tcp/4001/p2p/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM", // libp2p bootstrap node
 ];
 
 // Document types for MerkleDAG structure
