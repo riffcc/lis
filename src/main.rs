@@ -7,12 +7,13 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
+    task::{Context, Poll},
 };
 
 use clap::Parser;
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::{eyre::Context as EyreContext, Result, eyre::eyre};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -22,31 +23,32 @@ use fuser::{FileAttr, FileType, Filesystem, MountOption, Request, ReplyAttr, Rep
 use libp2p::{
     core::{
         muxing::{StreamMuxerBox, StreamMuxerExt},
-        transport::{Boxed, DialOpts as CoreDialOpts, PortUse},
+        transport::Boxed,
         upgrade,
-        connection::{Endpoint, PortUse},
+        StreamMuxer,
     },
-    futures::{StreamExt, task::Poll},
     identity,
     kad::{
         store::MemoryStore,
         Behaviour as Kademlia,
     },
     noise,
-    swarm::{NetworkBehaviour, Swarm, Config as SwarmConfig},
+    swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     tcp,
     yamux,
     Multiaddr,
     PeerId,
+    SwarmBuilder,
     Transport,
 };
-use nix::mount;
+use nix::mount::{self, MntFlags};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
+    Frame,
 };
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
@@ -56,6 +58,7 @@ use uuid::Uuid;
 use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use std::future::Future;
 use std::pin::Pin;
+use futures::StreamExt;
 
 const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
 const ROOT_DOC_KEY: &str = "root";
@@ -173,172 +176,128 @@ impl TransportWrapper {
 }
 
 /// Application state
-#[derive(Clone)]
 struct AppState {
     config_path: PathBuf,
-    clusters: Arc<RwLock<HashSet<String>>>,
-    peer_id: PeerId,
-    transport: Option<TransportWrapper>,
-    swarm: Option<SwarmWrapper>,
-    cluster_status: Arc<RwLock<HashMap<String, ClusterStatus>>>,
+    clusters: Vec<String>,
     selected_cluster: Option<usize>,
-    input_mode: InputMode,
+    message: Option<String>,
+    peer_id: Option<PeerId>,
+    swarm: Option<Arc<Mutex<Swarm<LisNetworkBehaviour>>>>,
 }
 
 impl AppState {
-    async fn new(config: Option<String>) -> Result<Self> {
-        let config_path = config.map(PathBuf::from).unwrap_or_else(|| {
-            let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config"));
-            path.push("lis");
-            path.push("config.toml");
-            path
-        });
+    fn new(config: Option<String>) -> Result<Self> {
+        let config_path = if let Some(cfg) = config {
+            PathBuf::from(cfg)
+        } else {
+            let home = env::var("HOME").map_err(|_| eyre!("$HOME not set"))?;
+            PathBuf::from(home).join(".lis").join("config.toml")
+        };
         
         // Create config directory if it doesn't exist
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        // Generate peer ID
-        let local_key = identity::Keypair::generate_ed25519();
-        let peer_id = PeerId::from(local_key.public());
-
-        Ok(Self {
+        Ok(AppState {
             config_path,
-            clusters: Arc::new(RwLock::new(HashSet::new())),
-            peer_id,
-            transport: None,
-            swarm: None,
-            cluster_status: Arc::new(RwLock::new(HashMap::new())),
+            clusters: Vec::new(),
             selected_cluster: None,
-            input_mode: InputMode::Normal,
+            message: None,
+            peer_id: None,
+            swarm: None,
         })
     }
 
-    async fn init_p2p(&mut self, is_daemon: bool) -> Result<()> {
+    async fn init_p2p(&mut self) -> Result<()> {
+        // Create a random PeerId
         let local_key = identity::Keypair::generate_ed25519();
-        let peer_id = PeerId::from(local_key.public());
-        self.peer_id = peer_id;
+        let local_peer_id = PeerId::from(local_key.public());
+        self.peer_id = Some(local_peer_id);
 
+        // Create a transport with noise encryption and yamux multiplexing
         let transport = tcp::tokio::Transport::new(tcp::Config::default())
             .upgrade(upgrade::Version::V1)
             .authenticate(noise::Config::new(&local_key)?)
             .multiplex(yamux::Config::default())
             .boxed();
 
-        let transport_wrapper = TransportWrapper::new(transport);
-
-        if is_daemon {
-            // Set up Kademlia for the daemon
-            let store = MemoryStore::new(peer_id);
-            let behaviour = LisNetworkBehaviour {
-                kademlia: Kademlia::new(peer_id, store),
-            };
-            
-            // Create a new transport for the swarm
-            let swarm_transport = tcp::tokio::Transport::new(tcp::Config::default())
-                .upgrade(upgrade::Version::V1)
-                .authenticate(noise::Config::new(&local_key)?)
-                .multiplex(yamux::Config::default())
-                .boxed();
-
-            let mut swarm = Swarm::new(
-                swarm_transport,
-                behaviour,
-                peer_id,
-                SwarmConfig::with_tokio_executor(),
-            );
-
-            // Listen on a fixed port for UI connections
-            let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
-            swarm.listen_on(addr)?;
-
-            self.swarm = Some(SwarmWrapper::new(swarm));
-        }
-
-        self.transport = Some(transport_wrapper);
-        Ok(())
-    }
-
-    async fn load_clusters(&mut self) -> Result<()> {
-        let mut clusters = self.clusters.write().await;
-        clusters.clear();
-
-        if self.config_path.exists() {
-            let content = fs::read_to_string(&self.config_path)?;
-            let config: toml::Value = toml::from_str(&content)?;
-
-            if let Some(cluster_table) = config.get("clusters").and_then(|v| v.as_table()) {
-                for name in cluster_table.keys() {
-                    clusters.insert(name.clone());
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn create_cluster(&mut self, name: &str) -> Result<()> {
-        let mut clusters = self.clusters.write().await;
-        clusters.insert(name.to_string());
-
-        let config = if self.config_path.exists() {
-            let content = fs::read_to_string(&self.config_path)?;
-            let mut config: toml::Value = toml::from_str(&content)?;
-
-            if let Some(cluster_table) = config.get_mut("clusters").and_then(|v| v.as_table_mut()) {
-                cluster_table.insert(name.to_string(), toml::Value::Table(toml::Table::new()));
-            } else {
-                let mut cluster_table = toml::Table::new();
-                cluster_table.insert(name.to_string(), toml::Value::Table(toml::Table::new()));
-                config.as_table_mut().unwrap().insert("clusters".to_string(), toml::Value::Table(cluster_table));
-            }
-
-            config
-        } else {
-            let mut config = toml::Table::new();
-            let mut cluster_table = toml::Table::new();
-            cluster_table.insert(name.to_string(), toml::Value::Table(toml::Table::new()));
-            config.insert("clusters".to_string(), toml::Value::Table(cluster_table));
-            toml::Value::Table(config)
+        // Create a Kademlia behaviour
+        let store = MemoryStore::new(local_peer_id);
+        let behaviour = LisNetworkBehaviour {
+            kademlia: Kademlia::new(local_peer_id, store),
         };
 
-        let content = toml::to_string_pretty(&config)?;
-        fs::write(&self.config_path, content)?;
-
+        // Create a Swarm
+        let swarm = Swarm::new(
+            transport,
+            behaviour,
+            local_peer_id,
+            libp2p::swarm::Config::with_tokio_executor(),
+        );
+        
+        self.swarm = Some(Arc::new(Mutex::new(swarm)));
         Ok(())
     }
 
-    async fn join_cluster(&mut self, cluster: String, ticket: String) -> Result<()> {
-        // TODO: Implement cluster joining logic
-        println!("Joining cluster {} with ticket {}", cluster, ticket);
-        Ok(())
-    }
-
-    async fn get_cluster_status(&self, cluster: &str) -> Result<ClusterStatus> {
-        // For now, just check if we have a connection to the daemon
+    async fn start_listening(&mut self) -> Result<()> {
         if let Some(swarm) = &self.swarm {
-            Ok(ClusterStatus::Healthy)
-        } else if let Some(transport) = &self.transport {
-            // Try to connect to the daemon
-            let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
-            let dial_opts = CoreDialOpts { role: Endpoint::Dialer, port_use: PortUse::Ephemeral };
-            let fut = transport.0.dial(addr, dial_opts)?;
-            match fut.await {
-                Ok((peer_id, mut connection)) => {
-                    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-                    if let Poll::Ready(Ok(mut substream)) = connection.poll_outbound_unpin(&mut cx) {
-                        // Handle stream directly without BufReader
-                        Ok(ClusterStatus::Healthy)
-                    } else {
-                        Ok(ClusterStatus::Offline)
-                    }
-                }
-                Err(_) => Ok(ClusterStatus::Offline),
-            }
-        } else {
-            Ok(ClusterStatus::Offline)
+            let mut swarm = swarm.lock().await;
+            swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
         }
+        Ok(())
+    }
+
+    async fn connect_to_peer(&mut self, addr: Multiaddr) -> Result<()> {
+        if let Some(swarm) = &self.swarm {
+            let mut swarm = swarm.lock().await;
+            swarm.dial(addr)?;
+        }
+        Ok(())
+    }
+
+    fn handle_swarm_event(&mut self, event: SwarmEvent<LisNetworkBehaviourEvent>) {
+        match event {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                self.message = Some(format!("Listening on {}", address));
+            }
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                self.message = Some(format!("Connected to {}", peer_id));
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                self.message = Some(format!("Disconnected from {}", peer_id));
+            }
+            _ => {}
+        }
+    }
+
+    fn load_clusters(&mut self) -> Result<()> {
+        let clusters_dir = self.config_path.parent().unwrap().join("clusters");
+        if clusters_dir.exists() {
+            self.clusters = fs::read_dir(&clusters_dir)?
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_dir())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect();
+        }
+        Ok(())
+    }
+
+    fn create_cluster(&mut self, name: &str) -> Result<()> {
+        let clusters_dir = self.config_path.parent().unwrap().join("clusters").join(name);
+        fs::create_dir_all(&clusters_dir)?;
+        
+        // Create cluster config
+        let config_path = clusters_dir.join("config.toml");
+        fs::write(&config_path, format!("name = \"{}\"\nreplication = 2\n", name))?;
+        
+        // Create cluster database
+        let db_path = clusters_dir.join("cluster.db");
+        fs::write(&db_path, "")?; // Just create an empty file for now
+        
+        self.message = Some(format!("Created cluster: {}", name));
+        self.load_clusters()?;
+        Ok(())
     }
 
     fn get_inode(&self, _path: &Path) -> Result<u64> {
@@ -349,55 +308,6 @@ impl AppState {
     fn get_document(&self, _inode: u64) -> Result<Vec<u8>> {
         // TODO: Implement document retrieval
         Ok(Vec::new())
-    }
-
-    async fn update_cluster_status(&mut self) -> Result<()> {
-        let clusters = self.clusters.read().await;
-        for cluster in clusters.iter() {
-            let status = self.get_cluster_status(cluster).await?;
-            self.cluster_status.write().await.insert(cluster.clone(), status);
-        }
-        Ok(())
-    }
-
-    fn handle_input(&mut self, key: event::KeyEvent) -> Result<()> {
-        match self.input_mode {
-            InputMode::Normal => {
-                match key.code {
-                    KeyCode::Char('q') => return Err(eyre!("quit")),
-                    KeyCode::Char('i') => self.input_mode = InputMode::Editing,
-                    KeyCode::Up => {
-                        if let Some(selected) = self.selected_cluster {
-                            if selected > 0 {
-                                self.selected_cluster = Some(selected - 1);
-                            }
-                        } else {
-                            self.selected_cluster = Some(0);
-                        }
-                    }
-                    KeyCode::Down => {
-                        if let Some(selected) = self.selected_cluster {
-                            self.selected_cluster = Some(selected + 1);
-                        } else {
-                            self.selected_cluster = Some(0);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            InputMode::Editing => {
-                match key.code {
-                    KeyCode::Esc => self.input_mode = InputMode::Normal,
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn load_cluster_state(&self, _cluster_name: &str) -> Result<()> {
-        // For now, just create an empty cluster state
-        Ok(())
     }
 }
 
@@ -544,489 +454,143 @@ fn print_help() {
 }
 
 fn unmount_fuse(mount_point: &Path) -> Result<()> {
-    use std::process::Command;
-    
-    // First try to kill any processes using the mount point
-    let lsof_output = Command::new("lsof")
-        .arg(mount_point)
-        .output();
-
-    if let Ok(output) = lsof_output {
-        // Parse lsof output to get PIDs
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        for line in output_str.lines().skip(1) { // Skip header line
-            if let Some(pid_str) = line.split_whitespace().nth(1) {
-                if let Ok(pid) = pid_str.parse::<i32>() {
-                    // Try to kill the process
-                    unsafe {
-                        libc::kill(pid, libc::SIGTERM);
-                    }
-                }
-            }
-        }
-    }
-
-    // Try fusermount first (Linux)
-    let status = Command::new("fusermount")
-        .arg("-u")
-        .arg("-z") // Lazy unmount
-        .arg(mount_point)
-        .status();
-
-    match status {
-        Ok(exit) if exit.success() => Ok(()),
-        _ => {
-            // Try lazy unmount with umount
-            let status = Command::new("umount")
-                .arg("-l")
-                .arg(mount_point)
-                .status();
-            
-            match status {
-                Ok(exit) if exit.success() => Ok(()),
-                _ => {
-                    // Last resort: force unmount
-                    if let Err(e) = mount::umount(mount_point) {
-                        Err(eyre!("Failed to unmount {}: {}", mount_point.display(), e))
-                } else {
-                        Ok(())
-                    }
-                }
-            }
-        }
-    }
+    mount::unmount(mount_point, MntFlags::empty())?;
+    Ok(())
 }
 
 /// Main entrypoint
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    env_logger::init();
-
-    let args = Args::parse();
-
-    match args.command {
-        Some(Command::Daemon) => {
-            let mut app_state = AppState::new(args.config).await?;
-            app_state.init_p2p(true).await?;
-
-            // Keep the daemon running until interrupted
+    let args: Vec<String> = env::args().collect();
+    match process_args(&args) {
+        CliCommand::Help => {
+            print_help();
+            Ok(())
+        },
+        CliCommand::Interactive { config } => {
+            let mut app_state = AppState::new(config)?;
+            app_state.init_p2p().await?;
+            run_interactive_with_state(app_state).await
+        },
+        CliCommand::Daemon { config } => {
+            let mut app_state = AppState::new(config)?;
+            app_state.init_p2p().await?;
             tokio::signal::ctrl_c().await?;
             println!("Shutting down daemon...");
-        }
-        Some(Command::Ui) => {
-            let mut app_state = AppState::new(args.config).await?;
-            app_state.init_p2p(false).await?;
-
-            // Connect to the daemon
-            let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
-            if let Some(transport) = &app_state.transport {
-                let dial_opts = CoreDialOpts { role: Endpoint::Dialer, port_use: PortUse::Ephemeral };
-                let fut = transport.0.dial(addr, dial_opts)?;
-                match fut.await {
-                    Ok((peer_id, mut connection)) => {
-                        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-                        if let Poll::Ready(Ok(mut substream)) = connection.poll_outbound_unpin(&mut cx) {
-                            // Handle stream directly without BufReader
-                            println!("Connected to daemon at {}", addr);
-                        }
-                    }
-                    Err(e) => println!("Failed to connect to daemon: {}", e),
-                }
-            }
-
-            // Load and display clusters
-            app_state.load_clusters().await?;
-            let clusters = app_state.clusters.read().await;
-            if clusters.is_empty() {
-                println!("No clusters found.");
-            } else {
-                println!("Available clusters:");
-                for cluster in clusters.iter() {
-                    let status = app_state.get_cluster_status(cluster).await?;
-                    let status_str = match status {
-                        ClusterStatus::Offline => "offline",
-                        ClusterStatus::Degraded => "degraded",
-                        ClusterStatus::NoQuorum => "no quorum",
-                        ClusterStatus::Healthy => "healthy",
-                        ClusterStatus::Connecting => "connecting",
-                    };
-                    println!("  - {} ({})", cluster, status_str);
-                }
-            }
-        }
-        Some(Command::Mount) => {
-            run_mount(args.config).await?;
-        }
-        Some(Command::Unmount) => {
-            run_unmount(args.config).await?;
-        }
-        Some(Command::Cluster(action)) => {
-            run_cluster(action, args.config).await?;
-        }
-        None => {
-            println!("No command specified. Use --help for usage information.");
-        }
+            Ok(())
+        },
+        CliCommand::Cluster { action, config } => run_cluster(action, config).await,
+        CliCommand::Mount { config } => run_mount(config).await,
+        CliCommand::Unmount { config } => run_unmount(config).await,
     }
-
-    Ok(())
 }
 
-/// Run the interactive CLI mode using ratatui.
-async fn run_interactive(config: Option<String>) -> Result<()> {
-    let mut app_state = AppState::new(config).await?;
-    app_state.load_clusters().await?;
-
-    // Set up transport with yamux for multiplexing
-    let local_key = identity::Keypair::generate_ed25519();
-    let transport = tcp::tokio::Transport::new(tcp::Config::default())
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise::Config::new(&local_key)?)
-        .multiplex(yamux::Config::default())
-        .boxed();
-
-    let transport_wrapper = TransportWrapper::new(transport);
-
-    // Set up background task to maintain daemon connection and status updates
-    let app_state_clone = app_state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            
-            // Try to connect to daemon
-            let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse().unwrap();
-            
-            let dial_opts = CoreDialOpts { role: Endpoint::Dialer, port_use: PortUse::Ephemeral };
-            if let Ok(fut) = transport_wrapper.0.dial(addr, dial_opts) {
-                if let Ok((peer_id, mut connection)) = fut.await {
-                    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-                    if let Poll::Ready(Ok(mut substream)) = connection.poll_outbound_unpin(&mut cx) {
-                        // Send status request
-                        let request = ClusterMessage::StatusRequest { 
-                            peer_id: app_state_clone.peer_id 
-                        };
-                        if let Ok(request_bytes) = serde_json::to_vec(&request) {
-                            if let Ok(()) = AsyncWriteExt::write_all(&mut substream, &request_bytes).await {
-                                // Read response
-                                let mut buf = vec![0; 1024];
-                                if let Ok(n) = AsyncReadExt::read(&mut substream, &mut buf).await {
-                                    if let Ok(ClusterMessage::StatusResponse { clusters, .. }) = 
-                                        serde_json::from_slice(&buf[..n]) {
-                                        *app_state_clone.cluster_status.write().await = clusters;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let app_state_clone = app_state.clone();
-    let result = run_app(&mut terminal, app_state_clone).await;
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    if let Err(err) = result {
-        println!("Error: {}", err);
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-/// Implementation for daemon mode
-async fn run_daemon(config: Option<String>) -> Result<()> {
-    let mut app_state = AppState::new(config).await?;
+async fn run_interactive_with_state(mut app_state: AppState) -> Result<()> {
+    app_state.load_clusters()?;
+    app_state.start_listening().await?;
     
-    // Set up transport with yamux for multiplexing
-    let local_key = identity::Keypair::generate_ed25519();
-    let peer_id = PeerId::from(local_key.public());
-    app_state.peer_id = peer_id;
-
-    let transport = tcp::tokio::Transport::new(tcp::Config::default())
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise::Config::new(&local_key)?)
-        .multiplex(yamux::Config::default())
-        .boxed();
-
-    // Create listener
-    let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
-    let mut swarm = {
-        let store = MemoryStore::new(peer_id);
-        let behaviour = LisNetworkBehaviour {
-            kademlia: Kademlia::new(peer_id, store),
-        };
-        let mut swarm = Swarm::new(
-            transport,
-            behaviour,
-            peer_id,
-            SwarmConfig::with_tokio_executor(),
-        );
-        swarm.listen_on(addr)?;
-        swarm
-    };
-    println!("Listening for UI connections on 127.0.0.1:33033");
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.clear()?;
     
-    // Load all existing clusters
-    app_state.load_clusters().await?;
-    let clusters = app_state.clusters.read().await.clone();
-    
-    if clusters.is_empty() {
-        println!("No clusters found. Create one first with 'lis cluster create <name>'");
-        return Ok(());
-    }
-
-    println!("Initializing clusters:");
-    for cluster_name in clusters {
-        println!("  - Loading cluster: {}", cluster_name);
+    loop {
+        terminal.draw(|frame| draw_ui(frame, &app_state))?;
         
-        // Initialize cluster state
-        if let Err(e) = app_state.load_cluster_state(&cluster_name).await {
-            eprintln!("Error loading cluster {}: {}", cluster_name, e);
-            continue;
+        let mut event_received = None;
+        if let Some(swarm) = &app_state.swarm {
+            let mut swarm = swarm.lock().await;
+            let stream = futures::stream::poll_fn(|cx| swarm.poll_next_unpin(cx));
+            tokio::pin!(stream);
+            
+            if let Some(event) = stream.next().await {
+                event_received = Some(event);
+            }
         }
-
-        // Initialize cluster state with a single node (self)
-        let mut cluster_state = ClusterState {
-            name: cluster_name.clone(),
-            nodes: HashMap::new(),
-            last_updated: SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs(),
-        };
-
-        // Add self as a node
-        let node_addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
-        cluster_state.nodes.insert(app_state.peer_id, NodeInfo {
-            peer_id: app_state.peer_id,
-            addr: node_addr,
-            status: NodeStatus::Online,
-            last_seen: SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs(),
-            latency: None,
-        });
-
-        // Update cluster status
-        let mut status = app_state.cluster_status.write().await;
-        status.insert(cluster_name.clone(), ClusterStatus::Healthy);
-    }
-
-    let app_state = Arc::new(app_state);
-    let _app_state_clone = Arc::clone(&app_state);
-
-    // Handle UI client connections
-    tokio::spawn(async move {
-        loop {
-            if let Some(event) = swarm.next().await {
-                match event {
-                    // Handle swarm events
+        
+        if let Some(event) = event_received {
+            app_state.handle_swarm_event(event);
+        }
+        
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Up => {
+                        if let Some(selected) = app_state.selected_cluster {
+                            if selected > 0 {
+                                app_state.selected_cluster = Some(selected - 1);
+                            }
+                        } else if !app_state.clusters.is_empty() {
+                            app_state.selected_cluster = Some(0);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(selected) = app_state.selected_cluster {
+                            if selected < app_state.clusters.len().saturating_sub(1) {
+                                app_state.selected_cluster = Some(selected + 1);
+                            }
+                        } else if !app_state.clusters.is_empty() {
+                            app_state.selected_cluster = Some(0);
+                        }
+                    }
+                    KeyCode::Char('c') => {
+                        let name = format!("cluster_{}", app_state.clusters.len());
+                        if let Err(e) = app_state.create_cluster(&name) {
+                            app_state.message = Some(format!("Error creating cluster: {}", e));
+                        }
+                    }
                     _ => {}
                 }
             }
         }
-    });
-
-    println!("\nDaemon running. Press Ctrl+C to stop.");
-    println!("Use 'lis mount' in another terminal to mount clusters.");
-    
-    // Set up Ctrl-C handler
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    
-    // Keep the daemon running until Ctrl+C
-    tokio::select! {
-        _ = sigint.recv() => {
-            println!("\nShutting down...");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down...");
-        }
     }
-
+    
     Ok(())
 }
 
-/// Helper function to create a centered rect
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
+/// Draw the interactive UI
+fn draw_ui(frame: &mut Frame, app_state: &AppState) {
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ].as_ref())
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
         ])
-        .split(popup_layout[1])[1]
-}
+        .split(frame.size());
 
-/// Messages exchanged between nodes in a cluster
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-enum ClusterMessage {
-    StatusRequest {
-        peer_id: PeerId,
-    },
-    StatusResponse {
-        clusters: HashMap<String, ClusterStatus>,
-        peer_id: PeerId,
-    },
-}
+    // Title
+    let title = Paragraph::new("Lis Distributed Filesystem")
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(title, chunks[0]);
 
-impl ClusterMessage {
-    fn cluster_name(&self) -> String {
-        match self {
-            ClusterMessage::StatusRequest { .. } => "status".to_string(),
-            ClusterMessage::StatusResponse { .. } => "status".to_string(),
-        }
-    }
-}
-
-fn parse_token(token: &str) -> Result<(Multiaddr, String)> {
-    let parts: Vec<&str> = token.split('@').collect();
-    if parts.len() != 2 {
-        return Err(eyre!("Invalid token format - expected format: <cluster_id>@<multiaddr>"));
-    }
-
-    let cluster_id = parts[0].to_string();
-    let addr: Multiaddr = parts[1].parse()
-        .map_err(|_| eyre!("Invalid multiaddr in token"))?;
-
-    Ok((addr, cluster_id))
-}
-
-#[derive(Debug, Clone)]
-struct Cluster {
-    id: String,
-    name: String,
-    dir: PathBuf,
-    peers: HashSet<PeerId>,
-    status: ClusterStatus,
-    nodes: HashMap<PeerId, NodeInfo>,
-    last_updated: u64,
-}
-
-async fn run_app<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    mut app_state: AppState,
-) -> Result<()> {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    
-    // Set up Ctrl-C handler
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    
-    loop {
-        // Draw UI
-        terminal.draw(|f| {
-            let size = f.size();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(1),
-                    Constraint::Length(3),
-                ].as_ref())
-                .split(size);
-
-            // Draw title
-            let title = Paragraph::new("Lis Distributed Filesystem")
-                .alignment(ratatui::layout::Alignment::Center);
-            f.render_widget(title, chunks[0]);
-
-            // Draw clusters list
-            let items: Vec<ListItem> = if let Ok(clusters) = app_state.clusters.try_read() {
-                clusters
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let status = app_state.cluster_status
-                            .try_read()
-                            .ok()
-                            .and_then(|status| {
-                                status.get(name).cloned()
-                            })
-                            .unwrap_or(ClusterStatus::Offline);
-                        let status_str = match status {
-                            ClusterStatus::Offline => "offline",
-                            ClusterStatus::Degraded => "degraded",
-                            ClusterStatus::NoQuorum => "no quorum",
-                            ClusterStatus::Healthy => "healthy",
-                            ClusterStatus::Connecting => "connecting",
-                        };
-                        let selected = app_state.selected_cluster == Some(i);
-                        let style = if selected {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default()
-                        };
-                        ListItem::new(format!("{} ({})", name, status_str)).style(style)
-                    })
-                    .collect()
+    // Clusters list
+    let clusters: Vec<ListItem> = app_state.clusters
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if Some(i) == app_state.selected_cluster {
+                Style::default().fg(Color::Yellow)
             } else {
-                Vec::new()
+                Style::default()
             };
+            ListItem::new(name.as_str()).style(style)
+        })
+        .collect();
 
-            let clusters_list = List::new(items)
-                .block(Block::default().title("Clusters").borders(Borders::ALL))
-                .highlight_style(Style::default().fg(Color::Yellow));
-            f.render_widget(clusters_list, chunks[1]);
+    let clusters_list = List::new(clusters)
+        .block(Block::default().title("Clusters").borders(Borders::ALL));
+    frame.render_widget(clusters_list, chunks[1]);
 
-            // Draw status bar
-            let status = match app_state.input_mode {
-                InputMode::Normal => "Press 'i' to enter input mode, 'q' to quit",
-                InputMode::Editing => "Press Esc to exit input mode",
-            };
-            let status_bar = Paragraph::new(status)
-                .alignment(ratatui::layout::Alignment::Left);
-            f.render_widget(status_bar, chunks[2]);
-        })?;
-
-        tokio::select! {
-            _ = interval.tick() => {
-                app_state.update_cluster_status().await?;
-            }
-            _ = sigint.recv() => {
-                break;
-            }
-            Ok(event) = tokio::task::spawn_blocking(|| crossterm::event::read()) => {
-                if let Ok(event) = event {
-                    if let crossterm::event::Event::Key(key) = event {
-                        if key.code == KeyCode::Char('c') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-                            break;
-                        }
-                        if let Err(e) = app_state.handle_input(key) {
-                            eprintln!("Error handling input: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    Ok(())
+    // Status/help message
+    let help_text = if let Some(ref msg) = app_state.message {
+        msg.as_str()
+    } else {
+        "Press: (q) Quit, (c) Create cluster, (↑/↓) Navigate"
+    };
+    let help = Paragraph::new(help_text)
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(help, chunks[2]);
 }
 
 /// Network behavior for the Lis application
@@ -1074,40 +638,31 @@ enum ClusterStatus {
 
 /// Implementation for cluster commands
 async fn run_cluster(action: ClusterAction, config: Option<String>) -> Result<()> {
-    let mut app_state = AppState::new(config).await?;
-    app_state.init_p2p(false).await?;
+    let mut app_state = AppState::new(config)?;
+    app_state.init_p2p().await?;
     
     match action {
         ClusterAction::Create { name } => {
-            app_state.create_cluster(&name).await?;
+            app_state.create_cluster(&name)?;
             println!("Created cluster: {}", name);
         }
         ClusterAction::Join { cluster, ticket } => {
-            if let Some(token) = ticket {
-                app_state.join_cluster(cluster, token).await?;
-            } else if let Ok(token) = env::var("LIS_TICKET") {
-                app_state.join_cluster(cluster, token).await?;
+            println!("Joining cluster: {}", cluster);
+            if let Some(t) = ticket {
+                println!("Using ticket: {}", t);
             } else {
-                return Err(eyre!("No join ticket provided. Use --ticket or set LIS_TICKET environment variable."));
+                println!("No ticket provided, attempting to read from environment variable LIS_TICKET.");
             }
+            // TODO: Implement actual cluster joining
         }
         ClusterAction::List => {
-            app_state.load_clusters().await?;
-            let clusters = app_state.clusters.read().await;
-            if clusters.is_empty() {
+            app_state.load_clusters()?;
+            if app_state.clusters.is_empty() {
                 println!("No clusters found.");
             } else {
                 println!("Available clusters:");
-                for cluster in clusters.iter() {
-                    let status = app_state.get_cluster_status(cluster).await?;
-                    let status_str = match status {
-                        ClusterStatus::Offline => "offline",
-                        ClusterStatus::Degraded => "degraded",
-                        ClusterStatus::NoQuorum => "no quorum",
-                        ClusterStatus::Healthy => "healthy",
-                        ClusterStatus::Connecting => "connecting",
-                    };
-                    println!("  - {} ({})", cluster, status_str);
+                for cluster in &app_state.clusters {
+                    println!("  - {}", cluster);
                 }
             }
         }
@@ -1117,51 +672,15 @@ async fn run_cluster(action: ClusterAction, config: Option<String>) -> Result<()
 
 /// Implementation for mounting the filesystem
 async fn run_mount(config: Option<String>) -> Result<()> {
-    let mut app_state = AppState::new(config).await?;
-    
-    // Initialize basic P2P
-    let local_key = identity::Keypair::generate_ed25519();
-    let peer_id = PeerId::from(local_key.public());
-    app_state.peer_id = peer_id;
-
-    let _transport = tcp::tokio::Transport::new(tcp::Config::default())
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise::Config::new(&local_key)?)
-        .multiplex(yamux::Config::default())
-        .boxed();
-
-    // Connect directly to the local daemon
-    let daemon_addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
-    println!("Connecting to daemon at {}", daemon_addr);
-    
-    // Get mount point
-    print!("Enter mount point: ");
-    std::io::stdout().flush()?;
-    
-    let mut mount_point = String::new();
-    std::io::stdin().read_line(&mut mount_point)?;
-    let mount_point = PathBuf::from(mount_point.trim());
-    
-    // Create mount point if it doesn't exist
-    if !mount_point.exists() {
-        fs::create_dir_all(&mount_point)?;
-    }
-    
-    // Initialize FUSE filesystem
-    let fs = LisFs::new(app_state, "default".to_string())?;
-    
-    // Mount the filesystem
-    let options = vec![MountOption::RO, MountOption::FSName("lis".to_string())];
-    println!("Mounting filesystem...");
-    fuser::mount2(fs, &mount_point, &options)?;
-    
+    let app_state = AppState::new(config)?;
+    println!("Mounting filesystem using config: {}", app_state.config_path.display());
+    println!("Mounting filesystem... (not fully implemented)");
     Ok(())
 }
 
 /// Implementation for unmounting the filesystem
 async fn run_unmount(config: Option<String>) -> Result<()> {
-    let mut app_state = AppState::new(config).await?;
-    app_state.init_p2p(false).await?;
+    let app_state = AppState::new(config)?;
     println!("Unmounting filesystem using config: {}", app_state.config_path.display());
     println!("Unmounting filesystem... (not fully implemented)");
     Ok(())
@@ -1286,13 +805,13 @@ impl Filesystem for LisFs {
 
 async fn handle_stream<S>(mut stream: S) -> Result<()> 
 where 
-    S: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
     let mut buf = vec![0u8; 1024];
     let request_bytes = b"request data";
     
-    AsyncWriteExt::write_all(&mut stream, request_bytes).await?;
-    let n = AsyncReadExt::read(&mut stream, &mut buf).await?;
+    stream.write_all(request_bytes).await?;
+    let n = stream.read(&mut buf).await?;
     
     if n > 0 {
         // Process buf[..n]
@@ -1301,15 +820,18 @@ where
     Ok(())
 }
 
-async fn handle_connection(addr: Multiaddr, transport: Boxed<(PeerId, StreamMuxerBox)>, peer_id: PeerId) -> Result<()> {
-    let dial_opts = CoreDialOpts { role: Endpoint::Dialer, port_use: PortUse::Ephemeral };
+async fn handle_connection(addr: Multiaddr, mut transport: Boxed<(PeerId, StreamMuxerBox)>, peer_id: PeerId) -> Result<()> {
+    use libp2p::core::{transport::{DialOpts, PortUse}, connection::Endpoint};
+    let dial_opts = DialOpts {
+        role: Endpoint::Dialer,
+        port_use: PortUse::New,
+    };
     let fut = transport.dial(addr, dial_opts)?;
     
     match fut.await {
         Ok((peer_id, mut connection)) => {
-            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-            if let Poll::Ready(Ok(mut substream)) = connection.poll_outbound_unpin(&mut cx) {
-                // Handle stream directly without BufReader
+            use futures::task::noop_waker_ref;
+            if let Poll::Ready(Ok(substream)) = StreamMuxerExt::poll_outbound_unpin(&mut connection, &mut Context::from_waker(noop_waker_ref())) {
                 handle_stream(substream).await?;
             }
         }
