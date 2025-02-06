@@ -21,11 +21,12 @@ use env_logger;
 use fuser::{FileAttr, FileType, Filesystem, MountOption, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry};
 use libp2p::{
     core::{
-        muxing::StreamMuxerBox,
-        transport::Boxed,
+        muxing::{StreamMuxerBox, StreamMuxerExt},
+        transport::{Boxed, DialOpts as CoreDialOpts, PortUse},
         upgrade,
+        connection::{Endpoint, PortUse},
     },
-    futures::StreamExt,
+    futures::{StreamExt, task::Poll},
     identity,
     kad::{
         store::MemoryStore,
@@ -52,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use toml;
 use uuid::Uuid;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -321,11 +322,13 @@ impl AppState {
         } else if let Some(transport) = &self.transport {
             // Try to connect to the daemon
             let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
-            let fut = transport.0.dial(addr, libp2p::core::transport::DialOpts::with_peer_id(self.peer_id))?;
+            let dial_opts = CoreDialOpts { role: Endpoint::Dialer, port_use: PortUse::Ephemeral };
+            let fut = transport.0.dial(addr, dial_opts)?;
             match fut.await {
                 Ok((peer_id, mut connection)) => {
-                    if let Ok(mut substream) = connection.open_outbound() {
-                        // Handle stream
+                    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                    if let Poll::Ready(Ok(mut substream)) = connection.poll_outbound_unpin(&mut cx) {
+                        // Handle stream directly without BufReader
                         Ok(ClusterStatus::Healthy)
                     } else {
                         Ok(ClusterStatus::Offline)
@@ -618,10 +621,13 @@ async fn main() -> Result<()> {
             // Connect to the daemon
             let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
             if let Some(transport) = &app_state.transport {
-                let fut = transport.0.dial(addr, libp2p::core::transport::DialOpts::with_peer_id(app_state.peer_id))?;
+                let dial_opts = CoreDialOpts { role: Endpoint::Dialer, port_use: PortUse::Ephemeral };
+                let fut = transport.0.dial(addr, dial_opts)?;
                 match fut.await {
                     Ok((peer_id, mut connection)) => {
-                        if let Ok(mut substream) = connection.open_outbound() {
+                        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                        if let Poll::Ready(Ok(mut substream)) = connection.poll_outbound_unpin(&mut cx) {
+                            // Handle stream directly without BufReader
                             println!("Connected to daemon at {}", addr);
                         }
                     }
@@ -691,18 +697,20 @@ async fn run_interactive(config: Option<String>) -> Result<()> {
             // Try to connect to daemon
             let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse().unwrap();
             
-            if let Ok(fut) = transport_wrapper.0.dial(addr, libp2p::core::transport::DialOpts::with_peer_id(app_state_clone.peer_id)) {
+            let dial_opts = CoreDialOpts { role: Endpoint::Dialer, port_use: PortUse::Ephemeral };
+            if let Ok(fut) = transport_wrapper.0.dial(addr, dial_opts) {
                 if let Ok((peer_id, mut connection)) = fut.await {
-                    if let Ok(mut substream) = connection.open_outbound() {
+                    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                    if let Poll::Ready(Ok(mut substream)) = connection.poll_outbound_unpin(&mut cx) {
                         // Send status request
                         let request = ClusterMessage::StatusRequest { 
                             peer_id: app_state_clone.peer_id 
                         };
                         if let Ok(request_bytes) = serde_json::to_vec(&request) {
-                            if let Ok(()) = substream.write_all(&request_bytes).await {
+                            if let Ok(()) = AsyncWriteExt::write_all(&mut substream, &request_bytes).await {
                                 // Read response
                                 let mut buf = vec![0; 1024];
-                                if let Ok(n) = substream.read(&mut buf).await {
+                                if let Ok(n) = AsyncReadExt::read(&mut substream, &mut buf).await {
                                     if let Ok(ClusterMessage::StatusResponse { clusters, .. }) = 
                                         serde_json::from_slice(&buf[..n]) {
                                         *app_state_clone.cluster_status.write().await = clusters;
@@ -1278,13 +1286,13 @@ impl Filesystem for LisFs {
 
 async fn handle_stream<S>(mut stream: S) -> Result<()> 
 where 
-    S: AsyncRead + AsyncWrite + AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
 {
     let mut buf = vec![0u8; 1024];
     let request_bytes = b"request data";
     
-    stream.write_all(request_bytes).await?;
-    let n = stream.read(&mut buf).await?;
+    AsyncWriteExt::write_all(&mut stream, request_bytes).await?;
+    let n = AsyncReadExt::read(&mut stream, &mut buf).await?;
     
     if n > 0 {
         // Process buf[..n]
@@ -1294,11 +1302,14 @@ where
 }
 
 async fn handle_connection(addr: Multiaddr, transport: Boxed<(PeerId, StreamMuxerBox)>, peer_id: PeerId) -> Result<()> {
-    let fut = transport.dial(addr, libp2p::core::transport::DialOpts::with_peer_id(peer_id))?;
+    let dial_opts = CoreDialOpts { role: Endpoint::Dialer, port_use: PortUse::Ephemeral };
+    let fut = transport.dial(addr, dial_opts)?;
     
     match fut.await {
         Ok((peer_id, mut connection)) => {
-            if let Ok(mut substream) = connection.open_outbound() {
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            if let Poll::Ready(Ok(mut substream)) = connection.poll_outbound_unpin(&mut cx) {
+                // Handle stream directly without BufReader
                 handle_stream(substream).await?;
             }
         }
