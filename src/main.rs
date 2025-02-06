@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
     task::{Context, Poll},
+    str::FromStr,
 };
 
 use clap::Parser;
@@ -421,10 +422,18 @@ impl AppState {
                 let mut swarm = swarm.lock().await;
                 println!("Bootstrapping with known nodes...");
                 for node in BOOTSTRAP_NODES.iter() {
-                    if let Ok(addr) = node.parse() {
-                        let peer_id = PeerId::random();
-                        println!("Adding bootstrap node: {} ({})", addr, peer_id);
-                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    if let Ok(addr) = node.parse::<Multiaddr>() {
+                        // Extract the peer ID from the multiaddr
+                        if let Some(peer_id) = addr.iter().find_map(|p| {
+                            if let libp2p::multiaddr::Protocol::P2p(hash) = p {
+                                Some(hash)
+                            } else {
+                                None
+                            }
+                        }) {
+                            println!("Adding bootstrap node: {} ({})", addr, peer_id);
+                            swarm.behaviour_mut().kademlia.add_address(&peer_id.into(), addr.clone());
+                        }
                     }
                 }
                 
@@ -1051,8 +1060,9 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
             }
         });
 
-        // Periodically announce ourselves on the DHT
+        // Periodically announce ourselves on the DHT for each cluster we host
         let swarm_clone = app_state.swarm.clone();
+        let clusters = app_state.clusters.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -1060,8 +1070,9 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                 if let Some(swarm) = &swarm_clone {
                     let mut swarm = swarm.lock().await;
                     // Announce ourselves for each cluster we're hosting
-                    for cluster in &app_state.clusters {
+                    for cluster in &clusters {
                         let topic = format!("lis-cluster:{}", cluster);
+                        println!("Announcing as provider for cluster: {}", cluster);
                         swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
                     }
                 }
@@ -1099,12 +1110,30 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                                 println!("Connected to peer: {}", peer_id);
+                                // When a peer connects, we'll check if they have a valid ticket
+                                for (cluster, tickets) in &hosted_tickets {
+                                    for (ticket_id, ticket_info) in tickets {
+                                        if let Some(ticket_peer_id) = ticket_info.get("peer_id").and_then(|v| v.as_str()) {
+                                            if let Ok(ticket_peer) = PeerId::from_str(ticket_peer_id) {
+                                                if ticket_peer == peer_id {
+                                                    println!("Peer {} has valid ticket {} for cluster {}", peer_id, ticket_id, cluster);
+                                                    // The peer is authorized to join this cluster
+                                                    if let Some(swarm) = &app_state.swarm {
+                                                        let mut swarm = swarm.lock().await;
+                                                        // Start providing the cluster topic to help other peers find us
+                                                        let topic = format!("lis-cluster:{}", cluster);
+                                                        swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                                 println!("Disconnected from peer: {}", peer_id);
                             }
                             SwarmEvent::Behaviour(behaviour_event) => {
-                                println!("Received DHT event: {:?}", behaviour_event);
                                 match behaviour_event {
                                     LisNetworkBehaviourEvent::Kademlia(kad_event) => {
                                         match kad_event {
