@@ -43,7 +43,7 @@ use libp2p::{
 };
 use nix::mount::{self, MntFlags};
 use ratatui::{
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     widgets::{Block, Borders, List, ListItem, Paragraph},
@@ -181,8 +181,11 @@ struct AppState {
     clusters: Vec<String>,
     selected_cluster: Option<usize>,
     message: Option<String>,
+    network_status: Option<String>,
     peer_id: Option<PeerId>,
     swarm: Option<Arc<Mutex<Swarm<LisNetworkBehaviour>>>>,
+    input_mode: InputMode,
+    input_buffer: String,
 }
 
 impl AppState {
@@ -204,8 +207,11 @@ impl AppState {
             clusters: Vec::new(),
             selected_cluster: None,
             message: None,
+            network_status: None,
             peer_id: None,
             swarm: None,
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
         })
     }
 
@@ -259,13 +265,13 @@ impl AppState {
     fn handle_swarm_event(&mut self, event: SwarmEvent<LisNetworkBehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                self.message = Some(format!("Listening on {}", address));
+                self.network_status = Some(format!("Listening on {}", address));
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                self.message = Some(format!("Connected to {}", peer_id));
+                self.network_status = Some(format!("Connected to {}", peer_id));
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                self.message = Some(format!("Disconnected from {}", peer_id));
+                self.network_status = Some(format!("Disconnected from {}", peer_id));
             }
             _ => {}
         }
@@ -308,6 +314,24 @@ impl AppState {
     fn get_document(&self, _inode: u64) -> Result<Vec<u8>> {
         // TODO: Implement document retrieval
         Ok(Vec::new())
+    }
+
+    fn generate_share_ticket(&self, cluster: &str) -> Result<String> {
+        let clusters_dir = self.config_path.parent().unwrap().join("clusters");
+        let cluster_path = clusters_dir.join(cluster);
+        
+        if !cluster_path.exists() {
+            return Err(eyre!("Cluster '{}' not found", cluster));
+        }
+
+        // Generate a unique ticket using the peer ID and cluster name
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
+        
+        let ticket_data = format!("{}:{}:{}", cluster, self.peer_id.unwrap(), timestamp);
+        let ticket_hash = blake3::hash(ticket_data.as_bytes());
+        Ok(hex::encode(&ticket_hash.as_bytes()[..16])) // Use first 16 bytes for a shorter ticket
     }
 }
 
@@ -363,6 +387,12 @@ enum ClusterAction {
         ticket: Option<String>,
     },
 
+    /// Share a cluster with others
+    Share {
+        /// Name of the cluster to share
+        cluster: String,
+    },
+
     /// List available clusters
     List,
 }
@@ -397,36 +427,46 @@ fn process_args(args: &[String]) -> CliCommand {
                 return CliCommand::Cluster { action: ClusterAction::List, config };
             }
 
-                match pos_args[1].as_str() {
-                    "create" => {
+            match pos_args[1].as_str() {
+                "create" => {
                     if pos_args.len() <= 2 {
-                            eprintln!("Error: cluster create requires a name");
-                            return CliCommand::Help;
-                        }
+                        eprintln!("Error: cluster create requires a name");
+                        return CliCommand::Help;
+                    }
                     CliCommand::Cluster { 
                         action: ClusterAction::Create { name: pos_args[2].clone() },
                         config 
-                        }
                     }
-                    "join" => {
+                }
+                "join" => {
                     if pos_args.len() <= 2 {
                         eprintln!("Error: cluster join requires a cluster name");
                         return CliCommand::Help;
                     }
-                            let cluster = pos_args[2].clone();
-                            let ticket = if pos_args.len() > 3 {
-                                Some(pos_args[3].clone())
-                            } else {
-                                env::var("LIS_TICKET").ok()
-                            };
+                    let cluster = pos_args[2].clone();
+                    let ticket = if pos_args.len() > 3 {
+                        Some(pos_args[3].clone())
+                    } else {
+                        env::var("LIS_TICKET").ok()
+                    };
                     CliCommand::Cluster { 
-                                action: ClusterAction::Join { cluster, ticket },
-                                config 
-                        }
+                        action: ClusterAction::Join { cluster, ticket },
+                        config 
                     }
-                _ => CliCommand::Cluster { action: ClusterAction::List, config }
                 }
+                "share" => {
+                    if pos_args.len() <= 2 {
+                        eprintln!("Error: cluster share requires a cluster name");
+                        return CliCommand::Help;
+                    }
+                    CliCommand::Cluster {
+                        action: ClusterAction::Share { cluster: pos_args[2].clone() },
+                        config
+                    }
+                }
+                _ => CliCommand::Cluster { action: ClusterAction::List, config }
             }
+        }
         "daemon" => CliCommand::Daemon { config },
         "mount"  => CliCommand::Mount { config },
         "unmount"=> CliCommand::Unmount { config },
@@ -445,6 +485,7 @@ fn print_help() {
     println!("  [no arguments]         Run Lis in CLI mode (interactive)");
     println!("  cluster create <name>  Create a new cluster");
     println!("  cluster join <name> [<ticket>]\n                         Join an existing cluster (ticket can be provided via LIS_TICKET env var)");
+    println!("  cluster share <name>   Share a cluster and generate a join ticket");
     println!("  cluster                List clusters");
     println!("  daemon                 Run Lis in daemon mode");
     println!("  mount                  Mount a Lis filesystem");
@@ -473,13 +514,7 @@ async fn main() -> Result<()> {
             app_state.init_p2p().await?;
             run_interactive_with_state(app_state).await
         },
-        CliCommand::Daemon { config } => {
-            let mut app_state = AppState::new(config)?;
-            app_state.init_p2p().await?;
-            tokio::signal::ctrl_c().await?;
-            println!("Shutting down daemon...");
-            Ok(())
-        },
+        CliCommand::Daemon { config } => run_daemon(config).await,
         CliCommand::Cluster { action, config } => run_cluster(action, config).await,
         CliCommand::Mount { config } => run_mount(config).await,
         CliCommand::Unmount { config } => run_unmount(config).await,
@@ -490,57 +525,99 @@ async fn run_interactive_with_state(mut app_state: AppState) -> Result<()> {
     app_state.load_clusters()?;
     app_state.start_listening().await?;
     
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    terminal.clear()?;
+    // Set up terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
     
+    // Run the main loop
+    let res = run_app(&mut terminal, &mut app_state).await;
+    
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    
+    // Return any error that occurred
+    res
+}
+
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_state: &mut AppState) -> Result<()> {
     loop {
         terminal.draw(|frame| draw_ui(frame, &app_state))?;
         
-        let mut event_received = None;
-        if let Some(swarm) = &app_state.swarm {
-            let mut swarm = swarm.lock().await;
-            let stream = futures::stream::poll_fn(|cx| swarm.poll_next_unpin(cx));
-            tokio::pin!(stream);
-            
-            if let Some(event) = stream.next().await {
-                event_received = Some(event);
+        // First check for keyboard events with a short timeout
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                match app_state.input_mode {
+                    InputMode::Normal => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Up => {
+                            if let Some(selected) = app_state.selected_cluster {
+                                if selected > 0 {
+                                    app_state.selected_cluster = Some(selected - 1);
+                                }
+                            } else if !app_state.clusters.is_empty() {
+                                app_state.selected_cluster = Some(0);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(selected) = app_state.selected_cluster {
+                                if selected < app_state.clusters.len().saturating_sub(1) {
+                                    app_state.selected_cluster = Some(selected + 1);
+                                }
+                            } else if !app_state.clusters.is_empty() {
+                                app_state.selected_cluster = Some(0);
+                            }
+                        }
+                        KeyCode::Char('c') => {
+                            app_state.input_mode = InputMode::Editing;
+                            app_state.input_buffer.clear();
+                            app_state.message = Some("Enter cluster name:".to_string());
+                        }
+                        _ => {}
+                    },
+                    InputMode::Editing => match key.code {
+                        KeyCode::Enter => {
+                            let name = app_state.input_buffer.trim().to_string();
+                            if !name.is_empty() {
+                                if let Err(e) = app_state.create_cluster(&name) {
+                                    app_state.message = Some(format!("Error creating cluster: {}", e));
+                                }
+                            }
+                            app_state.input_mode = InputMode::Normal;
+                            app_state.input_buffer.clear();
+                        }
+                        KeyCode::Esc => {
+                            app_state.input_mode = InputMode::Normal;
+                            app_state.input_buffer.clear();
+                            app_state.message = None;
+                        }
+                        KeyCode::Char(c) => {
+                            app_state.input_buffer.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            app_state.input_buffer.pop();
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         
-        if let Some(event) = event_received {
-            app_state.handle_swarm_event(event);
-        }
-        
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Up => {
-                        if let Some(selected) = app_state.selected_cluster {
-                            if selected > 0 {
-                                app_state.selected_cluster = Some(selected - 1);
-                            }
-                        } else if !app_state.clusters.is_empty() {
-                            app_state.selected_cluster = Some(0);
-                        }
-                    }
-                    KeyCode::Down => {
-                        if let Some(selected) = app_state.selected_cluster {
-                            if selected < app_state.clusters.len().saturating_sub(1) {
-                                app_state.selected_cluster = Some(selected + 1);
-                            }
-                        } else if !app_state.clusters.is_empty() {
-                            app_state.selected_cluster = Some(0);
-                        }
-                    }
-                    KeyCode::Char('c') => {
-                        let name = format!("cluster_{}", app_state.clusters.len());
-                        if let Err(e) = app_state.create_cluster(&name) {
-                            app_state.message = Some(format!("Error creating cluster: {}", e));
-                        }
-                    }
-                    _ => {}
-                }
+        // Then check for swarm events without blocking
+        if let Some(swarm) = &app_state.swarm {
+            let mut swarm = swarm.lock().await;
+            if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                // Drop the swarm lock before handling the event
+                drop(swarm);
+                app_state.handle_swarm_event(event);
             }
         }
     }
@@ -553,9 +630,10 @@ fn draw_ui(frame: &mut Frame, app_state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(3),  // Title
+            Constraint::Min(5),     // Clusters list
+            Constraint::Length(3),  // Network status
+            Constraint::Length(3),  // Help/Input
         ])
         .split(frame.size());
 
@@ -582,15 +660,25 @@ fn draw_ui(frame: &mut Frame, app_state: &AppState) {
         .block(Block::default().title("Clusters").borders(Borders::ALL));
     frame.render_widget(clusters_list, chunks[1]);
 
-    // Status/help message
-    let help_text = if let Some(ref msg) = app_state.message {
-        msg.as_str()
-    } else {
-        "Press: (q) Quit, (c) Create cluster, (↑/↓) Navigate"
+    // Network status
+    let status_text = app_state.network_status.as_deref().unwrap_or("No network activity");
+    let status_widget = Paragraph::new(status_text)
+        .block(Block::default().title("Network Status").borders(Borders::ALL));
+    frame.render_widget(status_widget, chunks[2]);
+
+    // Help/Input area
+    let bottom_text = match app_state.input_mode {
+        InputMode::Normal => {
+            app_state.message.as_deref().unwrap_or("Press: (q) Quit, (c) Create cluster, (↑/↓) Navigate")
+        }
+        InputMode::Editing => &app_state.input_buffer
     };
-    let help = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(help, chunks[2]);
+    
+    let bottom_widget = Paragraph::new(bottom_text)
+        .block(Block::default()
+            .title(if app_state.input_mode == InputMode::Editing { "Input" } else { "Help" })
+            .borders(Borders::ALL));
+    frame.render_widget(bottom_widget, chunks[3]);
 }
 
 /// Network behavior for the Lis application
@@ -655,6 +743,21 @@ async fn run_cluster(action: ClusterAction, config: Option<String>) -> Result<()
             }
             // TODO: Implement actual cluster joining
         }
+        ClusterAction::Share { cluster } => {
+            match app_state.generate_share_ticket(&cluster) {
+                Ok(ticket) => {
+                    println!("Generated share ticket for cluster '{}':", cluster);
+                    println!("Ticket: {}", ticket);
+                    println!("\nOthers can join using:");
+                    println!("  lis cluster join {} {}", cluster, ticket);
+                    println!("  # or");
+                    println!("  LIS_TICKET={} lis cluster join {}", ticket, cluster);
+                }
+                Err(e) => {
+                    println!("Error generating share ticket: {}", e);
+                }
+            }
+        }
         ClusterAction::List => {
             app_state.load_clusters()?;
             if app_state.clusters.is_empty() {
@@ -683,6 +786,94 @@ async fn run_unmount(config: Option<String>) -> Result<()> {
     let app_state = AppState::new(config)?;
     println!("Unmounting filesystem using config: {}", app_state.config_path.display());
     println!("Unmounting filesystem... (not fully implemented)");
+    Ok(())
+}
+
+/// Implementation for daemon mode
+async fn run_daemon(config: Option<String>) -> Result<()> {
+    let mut app_state = AppState::new(config)?;
+    println!("Starting daemon with config: {}", app_state.config_path.display());
+    
+    // Initialize P2P networking
+    app_state.init_p2p().await?;
+    app_state.start_listening().await?;
+    
+    // Load all available clusters
+    app_state.load_clusters()?;
+    if app_state.clusters.is_empty() {
+        println!("No clusters found in {}", app_state.config_path.parent().unwrap().join("clusters").display());
+    } else {
+        println!("Found clusters:");
+        for cluster in &app_state.clusters {
+            println!("  - {}", cluster);
+        }
+    }
+
+    // Start hosting clusters
+    if let Some(peer_id) = app_state.peer_id {
+        println!("Daemon running with peer ID: {}", peer_id);
+        
+        // Create a channel for shutdown signal
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let shutdown_tx_clone = shutdown_tx.clone();
+        
+        // Handle Ctrl+C
+        tokio::spawn(async move {
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                println!("\nReceived Ctrl+C, initiating shutdown...");
+                let _ = shutdown_tx_clone.send(()).await;
+            }
+        });
+
+        // Main event loop
+        println!("Daemon is running. Press Ctrl+C to stop.");
+        loop {
+            tokio::select! {
+                // Check for shutdown signal
+                _ = shutdown_rx.recv() => {
+                    println!("Shutting down daemon...");
+                    break;
+                }
+                
+                // Handle swarm events
+                event = async {
+                    if let Some(swarm) = &app_state.swarm {
+                        let mut swarm = swarm.lock().await;
+                        let mut event = None;
+                        if let Poll::Ready(Some(e)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                            event = Some(e);
+                        }
+                        drop(swarm);
+                        event
+                    } else {
+                        None
+                    }
+                } => {
+                    if let Some(event) = event {
+                        match event {
+                            SwarmEvent::NewListenAddr { address, .. } => {
+                                println!("Listening on {}", address);
+                            }
+                            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                                println!("Connected to peer: {}", peer_id);
+                            }
+                            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                                println!("Disconnected from peer: {}", peer_id);
+                            }
+                            SwarmEvent::Behaviour(behaviour_event) => {
+                                println!("Received DHT event: {:?}", behaviour_event);
+                                // Handle Kademlia events here
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        println!("Failed to initialize P2P networking");
+    }
+    
     Ok(())
 }
 
