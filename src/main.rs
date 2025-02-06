@@ -239,7 +239,7 @@ impl AppState {
         // Create a Kademlia behaviour with memory store
         let store = MemoryStore::new(local_peer_id);
         let mut kad = Kademlia::new(local_peer_id, store);
-
+        
         // Add bootstrap nodes
         for node in BOOTSTRAP_NODES.iter() {
             if let Ok(addr) = node.parse::<Multiaddr>() {
@@ -256,6 +256,9 @@ impl AppState {
                 }
             }
         }
+
+        // Enable server mode
+        kad.set_mode(Some(libp2p::kad::Mode::Server));
 
         let behaviour = LisNetworkBehaviour {
             kademlia: kad,
@@ -279,7 +282,30 @@ impl AppState {
     async fn start_listening(&mut self) -> Result<()> {
         if let Some(swarm) = &self.swarm {
             let mut swarm = swarm.lock().await;
-            swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?)?;
+            let mut port = DEFAULT_PORT;
+            let max_attempts = 10; // Try up to 10 ports
+            let mut success = false;
+
+            for _ in 0..max_attempts {
+                match swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", port).parse()?) {
+                    Ok(_) => {
+                        println!("Listening on port {}", port);
+                        success = true;
+                        break;
+                    }
+                    Err(e) => {
+                        println!("Failed to listen on port {}: {}", port, e);
+                        port += 1;
+                    }
+                }
+            }
+
+            if !success {
+                return Err(eyre!("Failed to find available port after {} attempts", max_attempts));
+            }
+
+            // Also listen on a random port for fallback
+            swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
         }
         Ok(())
     }
@@ -492,20 +518,29 @@ impl AppState {
                                                     match ok {
                                                         libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
                                                             for provider in providers {
-                                                                println!("Found provider: {:?}", provider);
+                                                                println!("Found provider: {}", provider);
+                                                                if let Some(swarm) = &self.swarm {
+                                                                    let mut swarm = swarm.lock().await;
+                                                                    if provider != *swarm.local_peer_id() {
+                                                                        let _ = swarm.dial(provider);
+                                                                    } else {
+                                                                        println!("Skipping self-connection");
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                         libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
-                                                            println!("No providers found, but got closest peers:");
+                                                            println!("No providers found, but got {} closest peers", closest_peers.len());
                                                             for peer in closest_peers {
-                                                                println!("  Closest peer: {:?}", peer);
+                                                                println!("  Closest peer: {}", peer);
                                                             }
                                                         }
                                                     }
                                                 }
                                                 libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                                    println!("Found {} close peers", ok.peers.len());
                                                     for peer in ok.peers {
-                                                        println!("Found close peer: {:?}", peer);
+                                                        println!("  Peer: {:?}", peer);
                                                     }
                                                 }
                                                 _ => {}
@@ -1084,10 +1119,20 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                         let topic = format!("lis-cluster:{}", cluster);
                         println!("Announcing as provider for cluster: {}", cluster);
                         swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
+                        
+                        // Also search for other nodes in this cluster
+                        println!("Searching for other nodes in cluster: {}", cluster);
+                        swarm.behaviour_mut().kademlia.get_providers(topic.as_bytes().to_vec().into());
                     }
                 }
             }
         });
+
+        // Keep track of connected peers for each cluster
+        let mut cluster_peers: HashMap<String, HashSet<PeerId>> = HashMap::new();
+        for cluster in &app_state.clusters {
+            cluster_peers.insert(cluster.clone(), HashSet::new());
+        }
 
         // Main event loop
         println!("Daemon is running. Press Ctrl+C to stop.");
@@ -1120,17 +1165,20 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                                 println!("Connected to peer: {}", peer_id);
-                                // When a peer connects, we'll check if they have a valid ticket
+                                // When a peer connects, check if they have a valid ticket
                                 for (cluster, tickets) in &hosted_tickets {
                                     for (ticket_id, ticket_info) in tickets {
                                         if let Some(ticket_peer_id) = ticket_info.get("peer_id").and_then(|v| v.as_str()) {
                                             if let Ok(ticket_peer) = PeerId::from_str(ticket_peer_id) {
                                                 if ticket_peer == peer_id {
                                                     println!("Peer {} has valid ticket {} for cluster {}", peer_id, ticket_id, cluster);
-                                                    // The peer is authorized to join this cluster
+                                                    // Add peer to cluster's peer set
+                                                    if let Some(peers) = cluster_peers.get_mut(cluster) {
+                                                        peers.insert(peer_id);
+                                                    }
+                                                    // Start providing the cluster topic
                                                     if let Some(swarm) = &app_state.swarm {
                                                         let mut swarm = swarm.lock().await;
-                                                        // Start providing the cluster topic to help other peers find us
                                                         let topic = format!("lis-cluster:{}", cluster);
                                                         swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
                                                     }
@@ -1142,6 +1190,10 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                             }
                             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                                 println!("Disconnected from peer: {}", peer_id);
+                                // Remove peer from all clusters it was in
+                                for peers in cluster_peers.values_mut() {
+                                    peers.remove(&peer_id);
+                                }
                             }
                             SwarmEvent::Behaviour(behaviour_event) => {
                                 match behaviour_event {
@@ -1153,20 +1205,29 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                         match ok {
                                                             libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
                                                                 for provider in providers {
-                                                                    println!("Found provider: {:?}", provider);
+                                                                    println!("Found provider: {}", provider);
+                                                                    if let Some(swarm) = &app_state.swarm {
+                                                                        let mut swarm = swarm.lock().await;
+                                                                        if provider != *swarm.local_peer_id() {
+                                                                            let _ = swarm.dial(provider);
+                                                                        } else {
+                                                                            println!("Skipping self-connection");
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                             libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
-                                                                println!("No providers found, but got closest peers:");
+                                                                println!("No providers found, but got {} closest peers", closest_peers.len());
                                                                 for peer in closest_peers {
-                                                                    println!("  Closest peer: {:?}", peer);
+                                                                    println!("  Closest peer: {}", peer);
                                                                 }
                                                             }
                                                         }
                                                     }
                                                     libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                                        println!("Found {} close peers", ok.peers.len());
                                                         for peer in ok.peers {
-                                                            println!("Found close peer: {:?}", peer);
+                                                            println!("  Peer: {:?}", peer);
                                                         }
                                                     }
                                                     _ => {}
