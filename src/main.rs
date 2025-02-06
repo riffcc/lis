@@ -60,6 +60,7 @@ use std::future::Future;
 use std::pin::Pin;
 use futures::StreamExt;
 use base64;
+use base64::Engine;
 
 const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
 const ROOT_DOC_KEY: &str = "root";
@@ -364,7 +365,7 @@ impl AppState {
         ticket_info.insert("data".into(), toml::Value::String(ticket_data.clone()));
         
         // Use base64 to make it more compact and avoid any special characters
-        let encoded_ticket = base64::encode(ticket_data);
+        let encoded_ticket = base64::engine::general_purpose::STANDARD.encode(ticket_data);
         tickets.insert(encoded_ticket.clone(), toml::Value::Table(ticket_info));
 
         fs::write(tickets_file, toml::to_string(&tickets)?)?;
@@ -394,8 +395,10 @@ impl AppState {
         self.start_listening().await?;
 
         // Decode and parse the ticket
-        let ticket_data = String::from_utf8(base64::decode(ticket)
-            .map_err(|_| eyre!("Invalid ticket encoding"))?)?;
+        let ticket_data = String::from_utf8(
+            base64::engine::general_purpose::STANDARD.decode(ticket)
+                .map_err(|_| eyre!("Invalid ticket encoding"))?
+        )?;
 
         let ticket_parts: Vec<&str> = ticket_data.split(':').collect();
         if ticket_parts.len() != 3 {
@@ -413,32 +416,86 @@ impl AppState {
         println!("Attempting to connect to host peer: {}", host_peer_id);
 
         if let Some(swarm) = &self.swarm {
-            let mut swarm = swarm.lock().await;
-            // Bootstrap with known nodes
-            for node in BOOTSTRAP_NODES.iter() {
-                if let Ok(addr) = node.parse() {
-                    swarm.behaviour_mut().kademlia.add_address(&PeerId::random(), addr);
+            // Bootstrap with known nodes first
+            {
+                let mut swarm = swarm.lock().await;
+                println!("Bootstrapping with known nodes...");
+                for node in BOOTSTRAP_NODES.iter() {
+                    if let Ok(addr) = node.parse() {
+                        let peer_id = PeerId::random();
+                        println!("Adding bootstrap node: {} ({})", addr, peer_id);
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    }
                 }
+                
+                // Start a bootstrap process
+                println!("Starting DHT bootstrap...");
+                swarm.behaviour_mut().kademlia.bootstrap()?;
             }
             
-            // Find the host peer through DHT
-            println!("Searching for cluster host with peer ID: {}", host_peer_id);
-            swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
+            // Wait a bit for bootstrap to take effect
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            
+            // Now try to find and connect to the host
+            {
+                let mut swarm = swarm.lock().await;
+                // Search for cluster providers
+                let topic = format!("lis-cluster:{}", cluster);
+                println!("Searching for cluster providers with topic: {}", topic);
+                swarm.behaviour_mut().kademlia.get_providers(topic.as_bytes().to_vec().into());
+                
+                // Also try direct connection to the host
+                println!("Searching for cluster host with peer ID: {}", host_peer_id);
+                swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
+            }
         }
 
         // Wait for connection to be established
         let mut attempts = 0;
-        while attempts < 30 {
+        let mut connected = false;
+        while attempts < 30 && !connected {
             if let Some(swarm) = &self.swarm {
                 let mut swarm = swarm.lock().await;
                 if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
                     match event {
                         SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_peer_id => {
                             println!("Successfully connected to cluster host!");
+                            connected = true;
                             break;
                         }
                         SwarmEvent::Behaviour(behaviour_event) => {
-                            println!("DHT event: {:?}", behaviour_event);
+                            match behaviour_event {
+                                LisNetworkBehaviourEvent::Kademlia(kad_event) => {
+                                    match kad_event {
+                                        libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
+                                            match result {
+                                                libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
+                                                    match ok {
+                                                        libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
+                                                            for provider in providers {
+                                                                println!("Found provider: {:?}", provider);
+                                                            }
+                                                        }
+                                                        libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
+                                                            println!("No providers found, but got closest peers:");
+                                                            for peer in closest_peers {
+                                                                println!("  Closest peer: {:?}", peer);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                                    for peer in ok.peers {
+                                                        println!("Found close peer: {:?}", peer);
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -448,10 +505,15 @@ impl AppState {
             attempts += 1;
             if attempts % 5 == 0 {
                 println!("Still trying to connect... ({}/30)", attempts);
+                if let Some(swarm) = &self.swarm {
+                    let mut swarm = swarm.lock().await;
+                    // Retry the search periodically
+                    swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
+                }
             }
         }
 
-        if attempts >= 30 {
+        if !connected {
             return Err(eyre!("Failed to connect to cluster host after 30 seconds"));
         }
 
@@ -942,14 +1004,34 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
     app_state.init_p2p().await?;
     app_state.start_listening().await?;
     
-    // Load all available clusters
+    // Load all available clusters and their tickets
     app_state.load_clusters()?;
+    let clusters_dir = app_state.config_path.parent().unwrap().join("clusters");
+    
+    let mut hosted_tickets = HashMap::new();
+    
+    // Load all tickets from all clusters
+    for cluster in &app_state.clusters {
+        let tickets_file = clusters_dir.join(cluster).join("tickets.toml");
+        if tickets_file.exists() {
+            if let Ok(content) = fs::read_to_string(&tickets_file) {
+                if let Ok(tickets) = toml::from_str::<toml::Table>(&content) {
+                    hosted_tickets.insert(cluster.clone(), tickets);
+                    println!("Loaded tickets for cluster: {}", cluster);
+                }
+            }
+        }
+    }
+
     if app_state.clusters.is_empty() {
-        println!("No clusters found in {}", app_state.config_path.parent().unwrap().join("clusters").display());
+        println!("No clusters found in {}", clusters_dir.display());
     } else {
         println!("Found clusters:");
         for cluster in &app_state.clusters {
             println!("  - {}", cluster);
+            if let Some(tickets) = hosted_tickets.get(cluster) {
+                println!("    Active tickets: {}", tickets.len());
+            }
         }
     }
 
@@ -966,6 +1048,23 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
             if let Ok(()) = tokio::signal::ctrl_c().await {
                 println!("\nReceived Ctrl+C, initiating shutdown...");
                 let _ = shutdown_tx_clone.send(()).await;
+            }
+        });
+
+        // Periodically announce ourselves on the DHT
+        let swarm_clone = app_state.swarm.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Some(swarm) = &swarm_clone {
+                    let mut swarm = swarm.lock().await;
+                    // Announce ourselves for each cluster we're hosting
+                    for cluster in &app_state.clusters {
+                        let topic = format!("lis-cluster:{}", cluster);
+                        swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
+                    }
+                }
             }
         });
 
@@ -1006,7 +1105,38 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                             }
                             SwarmEvent::Behaviour(behaviour_event) => {
                                 println!("Received DHT event: {:?}", behaviour_event);
-                                // Handle Kademlia events here
+                                match behaviour_event {
+                                    LisNetworkBehaviourEvent::Kademlia(kad_event) => {
+                                        match kad_event {
+                                            libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
+                                                match result {
+                                                    libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
+                                                        match ok {
+                                                            libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
+                                                                for provider in providers {
+                                                                    println!("Found provider: {:?}", provider);
+                                                                }
+                                                            }
+                                                            libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
+                                                                println!("No providers found, but got closest peers:");
+                                                                for peer in closest_peers {
+                                                                    println!("  Closest peer: {:?}", peer);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                                        for peer in ok.peers {
+                                                            println!("Found close peer: {:?}", peer);
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -1155,7 +1285,7 @@ where
     Ok(())
 }
 
-async fn handle_connection(addr: Multiaddr, mut transport: Boxed<(PeerId, StreamMuxerBox)>, peer_id: PeerId) -> Result<()> {
+async fn handle_connection(addr: Multiaddr, mut transport: Boxed<(PeerId, StreamMuxerBox)>, _peer_id: PeerId) -> Result<()> {
     use libp2p::core::{transport::{DialOpts, PortUse}, connection::Endpoint};
     let dial_opts = DialOpts {
         role: Endpoint::Dialer,
@@ -1164,7 +1294,7 @@ async fn handle_connection(addr: Multiaddr, mut transport: Boxed<(PeerId, Stream
     let fut = transport.dial(addr, dial_opts)?;
     
     match fut.await {
-        Ok((peer_id, mut connection)) => {
+        Ok((_peer_id, mut connection)) => {
             use futures::task::noop_waker_ref;
             if let Poll::Ready(Ok(substream)) = StreamMuxerExt::poll_outbound_unpin(&mut connection, &mut Context::from_waker(noop_waker_ref())) {
                 handle_stream(substream).await?;
