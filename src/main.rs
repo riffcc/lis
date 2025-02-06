@@ -1112,6 +1112,7 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
     let clusters_dir = app_state.config_path.parent().unwrap().join("clusters");
     
     let mut hosted_tickets = HashMap::new();
+    let connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
     
     // Load all tickets from all clusters
     for cluster in &app_state.clusters {
@@ -1154,25 +1155,30 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
             }
         });
 
-        // Periodically announce ourselves on the DHT for each cluster we host
+        // Periodically announce ourselves and print peer status
         let swarm_clone = app_state.swarm.clone();
         let clusters = app_state.clusters.clone();
+        let connected_peers_clone = connected_peers.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
                 if let Some(swarm) = &swarm_clone {
                     let mut swarm = swarm.lock().await;
-                    // Announce ourselves for each cluster we're hosting
+                    println!("\nPeriodic Status Update:");
+                    let peers = connected_peers_clone.lock().await;
+                    println!("Connected Peers: {}", peers.len());
+                    for peer in peers.iter() {
+                        println!("  - {}", peer);
+                    }
+                    println!("Active Clusters:");
                     for cluster in &clusters {
                         let topic = format!("lis-cluster:{}", cluster);
-                        println!("Announcing as provider for cluster: {}", cluster);
-                        swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
-                        
-                        // Also search for other nodes in this cluster
-                        println!("Searching for other nodes in cluster: {}", cluster);
-                        swarm.behaviour_mut().kademlia.get_providers(topic.as_bytes().to_vec().into());
+                        println!("  - {} (announcing and searching)", cluster);
+                        let _ = swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
+                        let _ = swarm.behaviour_mut().kademlia.get_providers(topic.as_bytes().to_vec().into());
                     }
+                    println!("");
                 }
             }
         });
@@ -1214,6 +1220,8 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                                 println!("Connected to peer: {}", peer_id);
+                                let mut peers = connected_peers.lock().await;
+                                peers.insert(peer_id);
                                 // When a peer connects, check if they have a valid ticket
                                 for (cluster, tickets) in &hosted_tickets {
                                     for (ticket_id, ticket_info) in tickets {
@@ -1229,7 +1237,7 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                     if let Some(swarm) = &app_state.swarm {
                                                         let mut swarm = swarm.lock().await;
                                                         let topic = format!("lis-cluster:{}", cluster);
-                                                        swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
+                                                        let _ = swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
                                                     }
                                                 }
                                             }
@@ -1239,6 +1247,8 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                             }
                             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                                 println!("Disconnected from peer: {}", peer_id);
+                                let mut peers = connected_peers.lock().await;
+                                peers.remove(&peer_id);
                                 // Remove peer from all clusters it was in
                                 for peers in cluster_peers.values_mut() {
                                     peers.remove(&peer_id);
@@ -1258,6 +1268,7 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                                     if let Some(swarm) = &app_state.swarm {
                                                                         let mut swarm = swarm.lock().await;
                                                                         if provider != *swarm.local_peer_id() {
+                                                                            println!("Attempting to connect to provider");
                                                                             let _ = swarm.dial(provider);
                                                                         } else {
                                                                             println!("Skipping self-connection");
@@ -1266,9 +1277,18 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                                 }
                                                             }
                                                             libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
-                                                                println!("No providers found, but got {} closest peers", closest_peers.len());
-                                                                for peer in closest_peers {
-                                                                    println!("  Closest peer: {}", peer);
+                                                                if !closest_peers.is_empty() {
+                                                                    println!("No providers found, but got {} closest peers", closest_peers.len());
+                                                                    for peer in closest_peers {
+                                                                        println!("  Closest peer: {}", peer);
+                                                                        if let Some(swarm) = &app_state.swarm {
+                                                                            let mut swarm = swarm.lock().await;
+                                                                            if peer != *swarm.local_peer_id() {
+                                                                                println!("Attempting to connect to closest peer");
+                                                                                let _ = swarm.dial(peer);
+                                                                            }
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                         }
