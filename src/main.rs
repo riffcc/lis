@@ -601,6 +601,15 @@ impl AppState {
                         match event {
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } if peer_id == host_peer_id => {
                                 println!("Successfully connected to cluster host!");
+                                // Store the working address
+                                let addr = endpoint.get_remote_address();
+                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.to_owned());
+                                println!("Stored working address: {}", addr);
+                                
+                                // Start providing the cluster topic to maintain visibility
+                                let topic = format!("lis-cluster:{}", cluster);
+                                let _ = swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
+                                
                                 connected = true;
                                 break;
                             }
@@ -672,13 +681,17 @@ impl AppState {
                     println!("Still trying to connect... ({}/30)", attempts);
                     if let Some(swarm) = &self.swarm {
                         let mut swarm = swarm.lock().await;
-                        // Retry all discovery methods periodically
+                        // Retry discovery methods periodically
                         let topic = format!("lis-cluster:{}", cluster);
                         swarm.behaviour_mut().kademlia.get_providers(topic.as_bytes().to_vec().into());
                         swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
                     }
                 }
             }
+        }
+
+        if !connected {
+            return Err(eyre!("Failed to connect to host peer after 30 seconds"));
         }
 
         // Add this cluster to our list
