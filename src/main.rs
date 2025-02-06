@@ -64,6 +64,10 @@ const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents"
 const ROOT_DOC_KEY: &str = "root";
 const NODE_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_PORT: u16 = 34163;
+const BOOTSTRAP_NODES: [&str; 2] = [
+    "/ip4/104.131.131.82/tcp/34163/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",  // libp2p bootstrap node
+    "/ip4/104.236.179.241/tcp/34163/p2p/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM", // libp2p bootstrap node
+];
 
 // Document types for MerkleDAG structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,20 +233,32 @@ impl AppState {
             .multiplex(yamux::Config::default())
             .boxed();
 
-        // Create a Kademlia behaviour
+        // Create a Kademlia behaviour with memory store
         let store = MemoryStore::new(local_peer_id);
+        let mut kad = Kademlia::new(local_peer_id, store);
+
+        // Add bootstrap nodes
+        for node in BOOTSTRAP_NODES.iter() {
+            if let Ok(addr) = node.parse() {
+                kad.add_address(&PeerId::random(), addr);
+            }
+        }
+
         let behaviour = LisNetworkBehaviour {
-            kademlia: Kademlia::new(local_peer_id, store),
+            kademlia: kad,
         };
 
         // Create a Swarm
-        let swarm = Swarm::new(
-            transport,
-            behaviour,
-            local_peer_id,
-            libp2p::swarm::Config::with_tokio_executor(),
-        );
-        
+        let mut swarm = SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+            .with_behaviour(|_| behaviour)?
+            .build();
+
+        // Enable hole punching in the swarm
+        swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?)?;
+        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?; // Also listen on a random port for fallback
+
         self.swarm = Some(Arc::new(Mutex::new(swarm)));
         Ok(())
     }
@@ -332,7 +348,108 @@ impl AppState {
         
         let ticket_data = format!("{}:{}:{}", cluster, self.peer_id.unwrap(), timestamp);
         let ticket_hash = blake3::hash(ticket_data.as_bytes());
-        Ok(hex::encode(&ticket_hash.as_bytes()[..16])) // Use first 16 bytes for a shorter ticket
+        let ticket = hex::encode(&ticket_hash.as_bytes()[..16]); // Use first 16 bytes for a shorter ticket
+
+        // Store the ticket in the cluster's tickets file
+        let tickets_file = cluster_path.join("tickets.toml");
+        let tickets_content = if tickets_file.exists() {
+            fs::read_to_string(&tickets_file)?
+        } else {
+            String::new()
+        };
+
+        let mut tickets: toml::Table = toml::from_str(&tickets_content).unwrap_or_default();
+        let mut ticket_info = toml::Table::new();
+        ticket_info.insert("peer_id".into(), toml::Value::String(self.peer_id.unwrap().to_string()));
+        ticket_info.insert("timestamp".into(), toml::Value::Integer(timestamp as i64));
+        tickets.insert(ticket.clone(), toml::Value::Table(ticket_info));
+
+        fs::write(tickets_file, toml::to_string(&tickets)?)?;
+        Ok(ticket)
+    }
+
+    async fn join_cluster(&mut self, cluster: &str, ticket: &str) -> Result<()> {
+        let clusters_dir = self.config_path.parent().unwrap().join("clusters");
+        let source_cluster_path = clusters_dir.join(cluster);
+        
+        if !source_cluster_path.exists() {
+            return Err(eyre!("Cluster '{}' not found", cluster));
+        }
+
+        // Verify the ticket
+        let tickets_file = source_cluster_path.join("tickets.toml");
+        if !tickets_file.exists() {
+            return Err(eyre!("No valid tickets found for cluster '{}'", cluster));
+        }
+
+        let tickets_content = fs::read_to_string(&tickets_file)?;
+        let tickets: toml::Table = toml::from_str(&tickets_content)?;
+
+        let ticket_info = tickets.get(ticket)
+            .ok_or_else(|| eyre!("Invalid ticket"))?
+            .as_table()
+            .ok_or_else(|| eyre!("Invalid ticket format"))?;
+
+        let peer_id_str = ticket_info.get("peer_id")
+            .ok_or_else(|| eyre!("Invalid ticket: missing peer ID"))?
+            .as_str()
+            .ok_or_else(|| eyre!("Invalid ticket: peer ID format"))?;
+
+        let host_peer_id: PeerId = peer_id_str.parse()?;
+
+        // Create local cluster directory
+        let local_cluster_path = clusters_dir.join(cluster);
+        fs::create_dir_all(&local_cluster_path)?;
+
+        // Copy cluster configuration
+        let config_file = source_cluster_path.join("config.toml");
+        if config_file.exists() {
+            fs::copy(&config_file, local_cluster_path.join("config.toml"))?;
+        }
+
+        // Start listening and attempt to connect via DHT
+        self.start_listening().await?;
+
+        if let Some(swarm) = &self.swarm {
+            let mut swarm = swarm.lock().await;
+            // Bootstrap with known nodes
+            for node in BOOTSTRAP_NODES.iter() {
+                if let Ok(addr) = node.parse() {
+                    swarm.behaviour_mut().kademlia.add_address(&PeerId::random(), addr);
+                }
+            }
+            
+            // Find the host peer through DHT
+            swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
+        }
+
+        // Wait for connection to be established
+        let mut attempts = 0;
+        while attempts < 30 {
+            if let Some(swarm) = &self.swarm {
+                let mut swarm = swarm.lock().await;
+                if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                    match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_peer_id => {
+                            println!("Successfully connected to cluster host!");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            attempts += 1;
+        }
+
+        if attempts >= 30 {
+            return Err(eyre!("Failed to connect to cluster host after 30 seconds"));
+        }
+
+        // Add this cluster to our list
+        self.load_clusters()?;
+
+        Ok(())
     }
 }
 
@@ -744,12 +861,21 @@ async fn run_cluster(action: ClusterAction, config: Option<String>) -> Result<()
         }
         ClusterAction::Join { cluster, ticket } => {
             println!("Joining cluster: {}", cluster);
-            if let Some(t) = ticket {
-                println!("Using ticket: {}", t);
+            let ticket = if let Some(t) = ticket {
+                t
             } else {
-                println!("No ticket provided, attempting to read from environment variable LIS_TICKET.");
+                env::var("LIS_TICKET").map_err(|_| eyre!("No ticket provided and LIS_TICKET not set"))?
+            };
+
+            match app_state.join_cluster(&cluster, &ticket).await {
+                Ok(()) => {
+                    println!("Successfully joined cluster '{}'", cluster);
+                    println!("Connected to cluster host and synchronized configuration");
+                }
+                Err(e) => {
+                    println!("Failed to join cluster: {}", e);
+                }
             }
-            // TODO: Implement actual cluster joining
         }
         ClusterAction::Share { cluster } => {
             match app_state.generate_share_ticket(&cluster) {
