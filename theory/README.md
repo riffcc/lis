@@ -56,6 +56,13 @@ Creating a new cluster will create a local Lis configuration file in `~/.lis/clu
 ### Adding additional ReDB databases
 Additional ReDB databases can be specified in the configuration file. If you specify new databases, over time data will be spread across them to keep the cluster balanced. You can specify a weight for each database to specify how much data you expect that database to contain, or specify a weight of zero to remove a database from the cluster configuration. You can specify replication=2 to keep two copies of each document spread throughout different ReDB databases, or replication=3-9 for up to 9 copies.
 
+## File structure
+/
+├── src/
+│   ├── main.rs
+├── Cargo.toml
+├── Cargo.lock
+
 ## Architecture
 * S3-compliant API
     * Lis is designed to be able to transparently store S3 objects.
