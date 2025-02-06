@@ -512,91 +512,112 @@ impl AppState {
             // Now try to find and connect to the host
             {
                 let mut swarm = swarm.lock().await;
-                // Search for cluster providers
+                // First announce ourselves as a provider for this cluster
                 let topic = format!("lis-cluster:{}", cluster);
+                println!("Announcing ourselves as provider for topic: {}", topic);
+                swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into())?;
+                
+                // Then search for other providers
                 println!("Searching for cluster providers with topic: {}", topic);
                 swarm.behaviour_mut().kademlia.get_providers(topic.as_bytes().to_vec().into());
                 
                 // Also try direct connection to the host
                 println!("Searching for cluster host with peer ID: {}", host_peer_id);
                 swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
+                
+                // Add the host peer ID to our routing table
+                println!("Adding host peer to routing table");
+                swarm.behaviour_mut().kademlia.add_address(&host_peer_id, format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?);
             }
-        }
 
-        // Wait for connection to be established
-        let mut attempts = 0;
-        let mut connected = false;
-        while attempts < 30 && !connected {
-            if let Some(swarm) = &self.swarm {
-                let mut swarm = swarm.lock().await;
-                if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
-                    match event {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_peer_id => {
-                            println!("Successfully connected to cluster host!");
-                            connected = true;
-                            break;
-                        }
-                        SwarmEvent::Behaviour(behaviour_event) => {
-                            match behaviour_event {
-                                LisNetworkBehaviourEvent::Kademlia(kad_event) => {
-                                    match kad_event {
-                                        libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
-                                            match result {
-                                                libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
-                                                    match ok {
-                                                        libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
-                                                            for provider in providers {
-                                                                println!("Found provider: {}", provider);
-                                                                if let Some(swarm) = &self.swarm {
-                                                                    let mut swarm = swarm.lock().await;
-                                                                    if provider != *swarm.local_peer_id() {
+            // Wait for connection to be established
+            let mut attempts = 0;
+            let mut connected = false;
+            while attempts < 30 && !connected {
+                if let Some(swarm) = &self.swarm {
+                    let mut swarm = swarm.lock().await;
+                    if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                        match event {
+                            SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_peer_id => {
+                                println!("Successfully connected to cluster host!");
+                                connected = true;
+                                break;
+                            }
+                            SwarmEvent::Behaviour(behaviour_event) => {
+                                match behaviour_event {
+                                    LisNetworkBehaviourEvent::Kademlia(kad_event) => {
+                                        match kad_event {
+                                            libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
+                                                match result {
+                                                    libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
+                                                        match ok {
+                                                            libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
+                                                                for provider in providers {
+                                                                    println!("Found provider: {}", provider);
+                                                                    if provider == host_peer_id {
+                                                                        println!("Found host peer as provider!");
+                                                                        let _ = swarm.dial(provider);
+                                                                    } else if provider != *swarm.local_peer_id() {
+                                                                        println!("Found other cluster peer, attempting connection");
                                                                         let _ = swarm.dial(provider);
                                                                     } else {
                                                                         println!("Skipping self-connection");
                                                                     }
                                                                 }
                                                             }
-                                                        }
-                                                        libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
-                                                            println!("No providers found, but got {} closest peers", closest_peers.len());
-                                                            for peer in closest_peers {
-                                                                println!("  Closest peer: {}", peer);
+                                                            libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
+                                                                println!("No providers found, but got {} closest peers", closest_peers.len());
+                                                                for peer in closest_peers {
+                                                                    println!("  Closest peer: {}", peer);
+                                                                    if peer == host_peer_id {
+                                                                        println!("Found host peer in closest peers!");
+                                                                        let _ = swarm.dial(peer);
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }
-                                                }
-                                                libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
-                                                    println!("Found {} close peers", ok.peers.len());
-                                                    for peer in ok.peers {
-                                                        println!("  Peer: {:?}", peer);
+                                                    libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                                        println!("Found {} close peers", ok.peers.len());
+                                                        for peer_info in ok.peers {
+                                                            let peer_id = peer_info.peer_id;
+                                                            println!("  Peer: {:?}", peer_id);
+                                                            if let Some(swarm) = &self.swarm {
+                                                                let mut swarm = swarm.lock().await;
+                                                                if peer_id != *swarm.local_peer_id() {
+                                                                    println!("Attempting to connect to peer");
+                                                                    let _ = swarm.dial(peer_id);
+                                                                } else {
+                                                                    println!("Skipping self-connection");
+                                                                }
+                                                            }
+                                                        }
                                                     }
+                                                    _ => {}
                                                 }
-                                                _ => {}
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                attempts += 1;
+                if attempts % 5 == 0 {
+                    println!("Still trying to connect... ({}/30)", attempts);
+                    if let Some(swarm) = &self.swarm {
+                        let mut swarm = swarm.lock().await;
+                        // Retry all discovery methods periodically
+                        let topic = format!("lis-cluster:{}", cluster);
+                        swarm.behaviour_mut().kademlia.get_providers(topic.as_bytes().to_vec().into());
+                        swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            attempts += 1;
-            if attempts % 5 == 0 {
-                println!("Still trying to connect... ({}/30)", attempts);
-                if let Some(swarm) = &self.swarm {
-                    let mut swarm = swarm.lock().await;
-                    // Retry the search periodically
-                    swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
-                }
-            }
-        }
-
-        if !connected {
-            return Err(eyre!("Failed to connect to cluster host after 30 seconds"));
         }
 
         // Add this cluster to our list
@@ -1254,8 +1275,18 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                     }
                                                     libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
                                                         println!("Found {} close peers", ok.peers.len());
-                                                        for peer in ok.peers {
-                                                            println!("  Peer: {:?}", peer);
+                                                        for peer_info in ok.peers {
+                                                            let peer_id = peer_info.peer_id;
+                                                            println!("  Peer: {:?}", peer_id);
+                                                            if let Some(swarm) = &app_state.swarm {
+                                                                let mut swarm = swarm.lock().await;
+                                                                if peer_id != *swarm.local_peer_id() {
+                                                                    println!("Attempting to connect to peer");
+                                                                    let _ = swarm.dial(peer_id);
+                                                                } else {
+                                                                    println!("Skipping self-connection");
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     _ => {}
