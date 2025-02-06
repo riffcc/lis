@@ -63,6 +63,7 @@ use futures::StreamExt;
 const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
 const ROOT_DOC_KEY: &str = "root";
 const NODE_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_PORT: u16 = 34163;
 
 // Document types for MerkleDAG structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,7 +250,7 @@ impl AppState {
     async fn start_listening(&mut self) -> Result<()> {
         if let Some(swarm) = &self.swarm {
             let mut swarm = swarm.lock().await;
-            swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+            swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?)?;
         }
         Ok(())
     }
