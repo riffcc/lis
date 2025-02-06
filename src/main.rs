@@ -1,69 +1,67 @@
-use std::env;
-use std::time::{Duration, UNIX_EPOCH, SystemTime};
-use std::path::PathBuf;
-use std::fs;
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::io::{self, Write};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    ffi::OsStr,
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use clap::Parser;
+use color_eyre::eyre::{eyre, Result};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use dirs;
+use env_logger;
+use fuser::{FileAttr, FileType, Filesystem, MountOption, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry};
 use libp2p::{
-    core::upgrade,
+    core::{
+        muxing::StreamMuxerBox,
+        transport::Boxed,
+        upgrade,
+    },
     futures::StreamExt,
     identity,
     kad::{
         store::MemoryStore,
-        Mode as KademliaMode,
-        QueryResult,
-        Event as KademliaEvent,
-        Behaviour as KademliaProtocol,
-        Record,
-        GetRecordOk,
-        PeerRecord,
+        Behaviour as Kademlia,
     },
     noise,
-    swarm::{NetworkBehaviour, SwarmEvent, Config as SwarmConfig},
+    swarm::{NetworkBehaviour, Swarm, Config as SwarmConfig},
     tcp,
-    PeerId,
-    Multiaddr,
     yamux,
-    Swarm,
+    Multiaddr,
+    PeerId,
     Transport,
 };
-
-use color_eyre::{Result, eyre::eyre};
-use crossterm::{
-    execute,
-    event::{self, Event, KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
-};
+use nix::mount;
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
-    widgets::{Paragraph, Block, Borders, List, ListItem},
-    layout::{Layout, Direction, Constraint, Rect},
-    style::{Style, Color},
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
-    Frame,
 };
-use blake3;
-use serde::{Serialize, Deserialize};
+use redb::TableDefinition;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock};
+use toml;
 use uuid::Uuid;
-use redb::{Database, TableDefinition};
-use fuser::{
-    FileType, FileAttr, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEntry, Request, FUSE_ROOT_ID,
-};
-use base64::{engine::general_purpose::STANDARD, Engine};
-use std::fmt;
-use libc::ENOENT;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use std::future::Future;
+use std::pin::Pin;
 
 const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
 const ROOT_DOC_KEY: &str = "root";
 const NODE_TIMEOUT_SECS: u64 = 60;
 
 // Document types for MerkleDAG structure
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RootDoc {
     inode_map: DocumentId,
     top_level_directory: DocumentId,
@@ -141,396 +139,319 @@ enum CliCommand {
     Unmount { config: Option<String> },
 }
 
-#[derive(Debug, PartialEq)]
-enum ClusterAction {
-    Create { name: String },
-    Join { cluster: String, ticket: Option<String> },
-    List,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputMode {
+    Normal,
+    Editing,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
+struct SwarmWrapper(Arc<Mutex<Swarm<LisNetworkBehaviour>>>);
+
+impl std::fmt::Debug for SwarmWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwarmWrapper")
+            .field("swarm", &"<Swarm>")
+            .finish()
+    }
+}
+
+impl SwarmWrapper {
+    fn new(swarm: Swarm<LisNetworkBehaviour>) -> Self {
+        Self(Arc::new(Mutex::new(swarm)))
+    }
+}
+
+#[derive(Clone)]
+struct TransportWrapper(Arc<Boxed<(PeerId, StreamMuxerBox)>>);
+
+impl TransportWrapper {
+    fn new(transport: Boxed<(PeerId, StreamMuxerBox)>) -> Self {
+        Self(Arc::new(transport))
+    }
+}
+
+/// Application state
+#[derive(Clone)]
 struct AppState {
     config_path: PathBuf,
-    clusters: Vec<String>,
+    clusters: Arc<RwLock<HashSet<String>>>,
+    peer_id: PeerId,
+    transport: Option<TransportWrapper>,
+    swarm: Option<SwarmWrapper>,
+    cluster_status: Arc<RwLock<HashMap<String, ClusterStatus>>>,
     selected_cluster: Option<usize>,
-    message: Option<String>,
-    root_doc: Option<RootDoc>,
-    db: Option<Database>,
-    p2p_node: Option<Arc<P2PNode>>,
-    cluster_status: HashMap<String, ClusterStatus>,
-    show_status: bool,
-    status_scroll: usize,
+    input_mode: InputMode,
 }
 
 impl AppState {
     async fn new(config: Option<String>) -> Result<Self> {
-        let config_path = if let Some(cfg) = config {
-            PathBuf::from(cfg)
-        } else {
-            let home = env::var("HOME").map_err(|_| eyre!("$HOME not set"))?;
-            PathBuf::from(home).join(".lis").join("config.toml")
-        };
+        let config_path = config.map(PathBuf::from).unwrap_or_else(|| {
+            let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config"));
+            path.push("lis");
+            path.push("config.toml");
+            path
+        });
         
         // Create config directory if it doesn't exist
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
+        // Generate peer ID
+        let local_key = identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from(local_key.public());
+
         Ok(Self {
             config_path,
-            clusters: Vec::new(),
+            clusters: Arc::new(RwLock::new(HashSet::new())),
+            peer_id,
+            transport: None,
+            swarm: None,
+            cluster_status: Arc::new(RwLock::new(HashMap::new())),
             selected_cluster: None,
-            show_status: false,
-            p2p_node: None,
-            message: None,
-            cluster_status: HashMap::new(),
-            status_scroll: 0,
-            root_doc: None,
-            db: None,
+            input_mode: InputMode::Normal,
         })
     }
 
-    fn load_clusters(&mut self) -> Result<()> {
-        let clusters_dir = self.config_path.parent().unwrap().join("clusters");
-        if clusters_dir.exists() {
-            self.clusters = fs::read_dir(&clusters_dir)?
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().is_dir())
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect();
+    async fn init_p2p(&mut self, is_daemon: bool) -> Result<()> {
+        let local_key = identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from(local_key.public());
+        self.peer_id = peer_id;
+
+        let transport = tcp::tokio::Transport::new(tcp::Config::default())
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise::Config::new(&local_key)?)
+            .multiplex(yamux::Config::default())
+            .boxed();
+
+        let transport_wrapper = TransportWrapper::new(transport);
+
+        if is_daemon {
+            // Set up Kademlia for the daemon
+            let store = MemoryStore::new(peer_id);
+            let behaviour = LisNetworkBehaviour {
+                kademlia: Kademlia::new(peer_id, store),
+            };
+            
+            // Create a new transport for the swarm
+            let swarm_transport = tcp::tokio::Transport::new(tcp::Config::default())
+                .upgrade(upgrade::Version::V1)
+                .authenticate(noise::Config::new(&local_key)?)
+                .multiplex(yamux::Config::default())
+                .boxed();
+
+            let mut swarm = Swarm::new(
+                swarm_transport,
+                behaviour,
+                peer_id,
+                SwarmConfig::with_tokio_executor(),
+            );
+
+            // Listen on a fixed port for UI connections
+            let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
+            swarm.listen_on(addr)?;
+
+            self.swarm = Some(SwarmWrapper::new(swarm));
         }
+
+        self.transport = Some(transport_wrapper);
         Ok(())
     }
 
-    fn load_cluster_state(&mut self, cluster_name: &str) -> Result<()> {
-        let cluster_dir = self.config_path.parent().unwrap()
-            .join("clusters")
-            .join(cluster_name);
-        
-        // Open ReDB database
-        let db_path = cluster_dir.join("cluster.db");
-        let db = Database::create(db_path)?;
-        let read_txn = db.begin_read()?;
-        let table = read_txn.open_table(DOCUMENTS)?;
-        
-        // Load root document
-        if let Some(root_doc_bytes) = table.get(ROOT_DOC_KEY)? {
-            let root_doc: RootDoc = serde_json::from_slice(root_doc_bytes.value())?;
-            self.root_doc = Some(root_doc);
-        }
+    async fn load_clusters(&mut self) -> Result<()> {
+        let mut clusters = self.clusters.write().await;
+        clusters.clear();
 
-        self.db = Some(db);
-        Ok(())
-    }
+        if self.config_path.exists() {
+            let content = fs::read_to_string(&self.config_path)?;
+            let config: toml::Value = toml::from_str(&content)?;
 
-    fn save_cluster_state(&self, _cluster_name: &str) -> Result<()> {
-        if let Some(db) = &self.db {
-            let write_txn = db.begin_write()?;
-            {
-                let mut table = write_txn.open_table(DOCUMENTS)?;
-                
-                // Save root document
-                if let Some(root_doc) = &self.root_doc {
-                    table.insert(ROOT_DOC_KEY, serde_json::to_vec(root_doc)?.as_slice())?;
+            if let Some(cluster_table) = config.get("clusters").and_then(|v| v.as_table()) {
+                for name in cluster_table.keys() {
+                    clusters.insert(name.clone());
                 }
             }
-            write_txn.commit()?;
-        }
-        Ok(())
-    }
-
-    fn validate_cluster_name(name: &str) -> Result<()> {
-        // Check for empty name
-        if name.is_empty() {
-            return Err(eyre!("Cluster name cannot be empty"));
         }
 
-        // Check length
-        if name.len() > 255 {
-            return Err(eyre!("Cluster name too long (max 255 characters)"));
-        }
-
-        // Check for valid characters
-        let valid_chars = name.chars().all(|c| {
-            c.is_alphanumeric() || c == '-' || c == '_'
-        });
-
-        if !valid_chars {
-            return Err(eyre!("Cluster name can only contain alphanumeric characters, hyphens, and underscores"));
-        }
-
-        // Check that it doesn't start with a hyphen or underscore
-        if name.starts_with('-') || name.starts_with('_') {
-            return Err(eyre!("Cluster name must start with a letter or number"));
-        }
-
-        Ok(())
-    }
-
-    async fn init_p2p(&mut self) -> Result<()> {
-        let p2p_node = P2PNode::new().await?;
-        self.p2p_node = Some(Arc::new(p2p_node));
-        
-        if let Some(node) = &self.p2p_node {
-            let node_clone = Arc::clone(node);
-            tokio::spawn(async move {
-                node_clone.run_network_loop().await;
-            });
-        }
-        
         Ok(())
     }
 
     async fn create_cluster(&mut self, name: &str) -> Result<()> {
-        // Create cluster directory
-        let cluster_dir = self.config_path.parent().unwrap()
-            .join("clusters")
-            .join(name);
-        fs::create_dir_all(&cluster_dir)?;
+        let mut clusters = self.clusters.write().await;
+        clusters.insert(name.to_string());
 
-        // Create and initialize the database
-        let db_path = cluster_dir.join("cluster.db");
-        let db = Database::create(db_path)?;
-        let write_txn = db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(DOCUMENTS)?;
+        let config = if self.config_path.exists() {
+            let content = fs::read_to_string(&self.config_path)?;
+            let mut config: toml::Value = toml::from_str(&content)?;
 
-            // Create empty children document for root directory
-            let children = ChildrenDoc { entries: Vec::new() };
-            let children_bytes = serde_json::to_vec(&children)?;
-            let children_id = DocumentId::new(&children_bytes);
-            table.insert(children_id.0.as_str(), children_bytes.as_slice())?;
-
-            // Create root directory metadata
-            let metadata = MetadataDoc {
-                name: "/".to_string(),
-                doc_type: DocType::Directory,
-                size: 0,
-                inode_uuid: Uuid::new_v4(),
-                modified: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                hash: None,
-            };
-            let metadata_bytes = serde_json::to_vec(&metadata)?;
-            let metadata_id = DocumentId::new(&metadata_bytes);
-            table.insert(metadata_id.0.as_str(), metadata_bytes.as_slice())?;
-
-            // Create root directory document
-            let directory = DirectoryDoc {
-                metadata: metadata_id,
-                children: children_id,
-            };
-            let directory_bytes = serde_json::to_vec(&directory)?;
-            let directory_id = DocumentId::new(&directory_bytes);
-            table.insert(directory_id.0.as_str(), directory_bytes.as_slice())?;
-
-            // Create empty inode map
-            let inode_map = InodeMapDoc {
-                inode_to_doc: HashMap::new(),
-                doc_to_inode: HashMap::new(),
-            };
-            let inode_map_bytes = serde_json::to_vec(&inode_map)?;
-            let inode_map_id = DocumentId::new(&inode_map_bytes);
-            table.insert(inode_map_id.0.as_str(), inode_map_bytes.as_slice())?;
-
-            // Create root document
-            let root_doc = RootDoc {
-                inode_map: inode_map_id,
-                top_level_directory: directory_id,
-            };
-            let root_doc_bytes = serde_json::to_vec(&root_doc)?;
-            table.insert(ROOT_DOC_KEY, root_doc_bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-
-        // Store database and root document in app state
-        self.db = Some(db);
-        if let Some(db) = &self.db {
-            let read_txn = db.begin_read()?;
-            let table = read_txn.open_table(DOCUMENTS)?;
-            if let Some(root_doc_bytes) = table.get(ROOT_DOC_KEY)? {
-                self.root_doc = Some(serde_json::from_slice(root_doc_bytes.value())?);
+            if let Some(cluster_table) = config.get_mut("clusters").and_then(|v| v.as_table_mut()) {
+                cluster_table.insert(name.to_string(), toml::Value::Table(toml::Table::new()));
+            } else {
+                let mut cluster_table = toml::Table::new();
+                cluster_table.insert(name.to_string(), toml::Value::Table(toml::Table::new()));
+                config.as_table_mut().unwrap().insert("clusters".to_string(), toml::Value::Table(cluster_table));
             }
-        }
 
-        // Initialize P2P node if needed
-        if let Some(node) = &self.p2p_node {
-            let token = node.share_token()?;
-            self.clusters.push(name.to_string());
-            self.message = Some(format!("Share this token: {}", token));
-        }
-
-        Ok(())
-    }
-
-    async fn join_cluster(&mut self, name: &str, token: &str) -> Result<()> {
-        if let Some(node) = &mut self.p2p_node {
-            let node = Arc::get_mut(node).ok_or_else(|| eyre!("Failed to get mutable reference to P2PNode"))?;
-            node.join_cluster(name, token).await?;
-            self.message = Some(format!("Joined cluster: {}", name));
-            self.load_clusters()?;
-        }
-        Ok(())
-    }
-
-    async fn update_cluster_status(&mut self) -> Result<()> {
-        if let Some(node) = &self.p2p_node {
-            let states = node.clusters.read().await;
-            for (name, state) in states.iter() {
-                let online_count = state.nodes.values()
-                    .filter(|n| n.status == NodeStatus::Online)
-                    .count();
-                let total_count = state.nodes.len();
-
-                if !self.clusters.contains(name) {
-                    self.clusters.push(name.clone());
-                }
-
-                let status = match (online_count, total_count) {
-                    (0, _) => ClusterStatus::Offline,
-                    (n, t) if n < t => ClusterStatus::Degraded,
-                    (n, t) if n < t * 2/3 => ClusterStatus::NoQuorum,
-                    _ => ClusterStatus::Healthy,
-                };
-
-                self.cluster_status.insert(name.clone(), status);
-            }
-        }
-        Ok(())
-    }
-
-    async fn get_cluster_nodes(&self, name: &str) -> Result<Vec<NodeInfo>> {
-        if let Some(node) = &self.p2p_node {
-            node.get_cluster_nodes(name).await
+            config
         } else {
-            Ok(Vec::new())
-        }
+            let mut config = toml::Table::new();
+            let mut cluster_table = toml::Table::new();
+            cluster_table.insert(name.to_string(), toml::Value::Table(toml::Table::new()));
+            config.insert("clusters".to_string(), toml::Value::Table(cluster_table));
+            toml::Value::Table(config)
+        };
+
+        let content = toml::to_string_pretty(&config)?;
+        fs::write(&self.config_path, content)?;
+
+        Ok(())
     }
 
-    fn get_document(&self, id: &DocumentId) -> Result<Vec<u8>> {
-        if let Some(db) = &self.db {
-            let read_txn = db.begin_read()?;
-            let table = read_txn.open_table(DOCUMENTS)?;
-            if let Some(content) = table.get(id.0.as_str())? {
-                return Ok(content.value().to_vec());
-            }
-        }
-        Err(eyre!("Document not found: {:?}", id))
-    }
-
-    fn put_document(&mut self, content: Vec<u8>) -> Result<DocumentId> {
-        let id = DocumentId::new(&content);
-        if let Some(db) = &self.db {
-            let write_txn = db.begin_write()?;
-            {
-                let mut table = write_txn.open_table(DOCUMENTS)?;
-                table.insert(id.0.as_str(), content.as_slice())?;
-            }
-            write_txn.commit()?;
-        }
-        Ok(id)
-    }
-
-    pub fn create_file(&mut self, parent_dir_id: &DocumentId, name: &str, content: Vec<u8>) -> Result<DocumentId> {
-        // Create file metadata
-        let metadata = MetadataDoc {
-            name: name.to_string(),
-            doc_type: DocType::File,
-            size: content.len() as u64,
-            inode_uuid: Uuid::new_v4(),
-            modified: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-            hash: Some(hex::encode(blake3::hash(&content).as_bytes())),
-        };
-        let metadata_bytes = serde_json::to_vec(&metadata)?;
-        let metadata_id = self.put_document(metadata_bytes)?;
-
-        // Create file document
-        let file_doc = FileDoc {
-            metadata: metadata_id.clone(),
-            chunks: vec![self.put_document(content)?],
-        };
-        let file_doc_bytes = serde_json::to_vec(&file_doc)?;
-        let file_doc_id = self.put_document(file_doc_bytes)?;
-
-        // Update parent directory
-        let parent_dir_bytes = self.get_document(parent_dir_id)?;
-        let parent_dir: DirectoryDoc = serde_json::from_slice(&parent_dir_bytes)?;
-        
-        let children_bytes = self.get_document(&parent_dir.children)?;
-        let mut children: ChildrenDoc = serde_json::from_slice::<ChildrenDoc>(&children_bytes)?;
-        
-        children.entries.push(DirectoryEntry::File {
-            name: name.to_string(),
-            file_doc: file_doc_id.clone(),
-        });
-        
-        let children_bytes = serde_json::to_vec(&children)?;
-        let children_id = self.put_document(children_bytes)?;
-        
-        let updated_dir = DirectoryDoc {
-            metadata: parent_dir.metadata,
-            children: children_id,
-        };
-        let updated_dir_bytes = serde_json::to_vec(&updated_dir)?;
-
-        // Update the parent directory ID in the database
-        if let Some(db) = &self.db {
-            let write_txn = db.begin_write()?;
-            {
-                let mut table = write_txn.open_table(DOCUMENTS)?;
-                table.insert(parent_dir_id.0.as_str(), &*updated_dir_bytes)?;
-            }
-            write_txn.commit()?;
-        }
-
-        // Update inode map
-        if let Some(root_doc) = &self.root_doc {
-            let inode_map_id = root_doc.inode_map.clone();
-            let inode_map_bytes = self.get_document(&inode_map_id)?;
-            let mut inode_map: InodeMapDoc = serde_json::from_slice(&inode_map_bytes)?;
-            
-            inode_map.inode_to_doc.insert(metadata.inode_uuid, file_doc_id.clone());
-            inode_map.doc_to_inode.insert(file_doc_id.clone(), metadata.inode_uuid);
-            
-            let inode_map_bytes = serde_json::to_vec(&inode_map)?;
-
-            // Update the inode map ID in the database
-            if let Some(db) = &self.db {
-                let write_txn = db.begin_write()?;
-                {
-                    let mut table = write_txn.open_table(DOCUMENTS)?;
-                    table.insert(inode_map_id.0.as_str(), &*inode_map_bytes)?;
-                }
-                write_txn.commit()?;
-            }
-        }
-
-        Ok(file_doc_id)
+    async fn join_cluster(&mut self, cluster: String, ticket: String) -> Result<()> {
+        // TODO: Implement cluster joining logic
+        println!("Joining cluster {} with ticket {}", cluster, ticket);
+        Ok(())
     }
 
     async fn get_cluster_status(&self, cluster: &str) -> Result<ClusterStatus> {
-        if let Some(node) = &self.p2p_node {
-            let states = node.clusters.read().await;
-            if let Some(state) = states.get(cluster) {
-                let online_count = state.nodes.values()
-                    .filter(|n| n.status == NodeStatus::Online)
-                    .count();
-                let total_count = state.nodes.len();
-
-                match (online_count, total_count) {
-                    (0, _) => Ok(ClusterStatus::Offline),
-                    (n, t) if n < t => Ok(ClusterStatus::Degraded),
-                    (n, t) if n < t * 2/3 => Ok(ClusterStatus::NoQuorum),
-                    _ => Ok(ClusterStatus::Healthy),
+        // For now, just check if we have a connection to the daemon
+        if let Some(swarm) = &self.swarm {
+            Ok(ClusterStatus::Healthy)
+        } else if let Some(transport) = &self.transport {
+            // Try to connect to the daemon
+            let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
+            let fut = transport.0.dial(addr, libp2p::core::transport::DialOpts::with_peer_id(self.peer_id))?;
+            match fut.await {
+                Ok((peer_id, mut connection)) => {
+                    if let Ok(mut substream) = connection.open_outbound() {
+                        // Handle stream
+                        Ok(ClusterStatus::Healthy)
+                    } else {
+                        Ok(ClusterStatus::Offline)
+                    }
                 }
-            } else {
-                Ok(ClusterStatus::Offline)
+                Err(_) => Ok(ClusterStatus::Offline),
             }
         } else {
             Ok(ClusterStatus::Offline)
         }
     }
+
+    fn get_inode(&self, _path: &Path) -> Result<u64> {
+        // TODO: Implement proper inode mapping
+        Ok(1)
+    }
+
+    fn get_document(&self, _inode: u64) -> Result<Vec<u8>> {
+        // TODO: Implement document retrieval
+        Ok(Vec::new())
+    }
+
+    async fn update_cluster_status(&mut self) -> Result<()> {
+        let clusters = self.clusters.read().await;
+        for cluster in clusters.iter() {
+            let status = self.get_cluster_status(cluster).await?;
+            self.cluster_status.write().await.insert(cluster.clone(), status);
+        }
+        Ok(())
+    }
+
+    fn handle_input(&mut self, key: event::KeyEvent) -> Result<()> {
+        match self.input_mode {
+            InputMode::Normal => {
+                match key.code {
+                    KeyCode::Char('q') => return Err(eyre!("quit")),
+                    KeyCode::Char('i') => self.input_mode = InputMode::Editing,
+                    KeyCode::Up => {
+                        if let Some(selected) = self.selected_cluster {
+                            if selected > 0 {
+                                self.selected_cluster = Some(selected - 1);
+                            }
+                        } else {
+                            self.selected_cluster = Some(0);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(selected) = self.selected_cluster {
+                            self.selected_cluster = Some(selected + 1);
+                        } else {
+                            self.selected_cluster = Some(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            InputMode::Editing => {
+                match key.code {
+                    KeyCode::Esc => self.input_mode = InputMode::Normal,
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_cluster_state(&self, _cluster_name: &str) -> Result<()> {
+        // For now, just create an empty cluster state
+        Ok(())
+    }
+}
+
+/// Command line arguments
+#[derive(Debug, clap::Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to config file
+    #[arg(short, long)]
+    config: Option<String>,
+
+    /// Command to run
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Available commands
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Run the daemon
+    Daemon,
+
+    /// Run the UI
+    Ui,
+
+    /// Mount a cluster
+    Mount,
+
+    /// Unmount a cluster
+    Unmount,
+
+    /// Cluster management commands
+    #[command(subcommand)]
+    Cluster(ClusterAction),
+}
+
+/// Cluster management actions
+#[derive(Debug, clap::Subcommand, PartialEq)]
+enum ClusterAction {
+    /// Create a new cluster
+    Create {
+        /// Name of the cluster
+        name: String,
+    },
+
+    /// Join an existing cluster
+    Join {
+        /// Name of the cluster
+        cluster: String,
+
+        /// Join ticket
+        #[arg(short, long)]
+        ticket: Option<String>,
+    },
+
+    /// List available clusters
+    List,
 }
 
 /// Parses CLI arguments and returns a CliCommand.
@@ -538,6 +459,7 @@ fn process_args(args: &[String]) -> CliCommand {
     let mut config = None;
     let mut pos_args = Vec::new();
     let mut iter = args.iter().skip(1).peekable();
+    
     while let Some(arg) = iter.next() {
         if arg == "--help" || arg == "-h" {
             return CliCommand::Help;
@@ -551,47 +473,47 @@ fn process_args(args: &[String]) -> CliCommand {
             pos_args.push(arg.clone());
         }
     }
+
     if pos_args.is_empty() {
         return CliCommand::Interactive { config };
     }
+
     match pos_args[0].as_str() {
         "cluster" | "clusters" => {
-            if pos_args.len() > 1 {
+            if pos_args.len() <= 1 {
+                return CliCommand::Cluster { action: ClusterAction::List, config };
+            }
+
                 match pos_args[1].as_str() {
                     "create" => {
-                        if pos_args.len() > 2 {
-                            return CliCommand::Cluster { 
-                                action: ClusterAction::Create { name: pos_args[2].clone() },
-                                config 
-                            };
-                        } else {
+                    if pos_args.len() <= 2 {
                             eprintln!("Error: cluster create requires a name");
                             return CliCommand::Help;
                         }
+                    CliCommand::Cluster { 
+                        action: ClusterAction::Create { name: pos_args[2].clone() },
+                        config 
+                        }
                     }
                     "join" => {
-                        if pos_args.len() > 2 {
+                    if pos_args.len() <= 2 {
+                        eprintln!("Error: cluster join requires a cluster name");
+                        return CliCommand::Help;
+                    }
                             let cluster = pos_args[2].clone();
                             let ticket = if pos_args.len() > 3 {
                                 Some(pos_args[3].clone())
                             } else {
                                 env::var("LIS_TICKET").ok()
                             };
-                            return CliCommand::Cluster { 
+                    CliCommand::Cluster { 
                                 action: ClusterAction::Join { cluster, ticket },
                                 config 
-                            };
-                        } else {
-                            eprintln!("Error: cluster join requires a cluster name");
-                            return CliCommand::Help;
                         }
                     }
-                    _ => return CliCommand::Cluster { action: ClusterAction::List, config },
+                _ => CliCommand::Cluster { action: ClusterAction::List, config }
                 }
-            } else {
-                return CliCommand::Cluster { action: ClusterAction::List, config };
             }
-        }
         "daemon" => CliCommand::Daemon { config },
         "mount"  => CliCommand::Mount { config },
         "unmount"=> CliCommand::Unmount { config },
@@ -618,138 +540,181 @@ fn print_help() {
     println!("  --config <CONFIG>      Path to the Lis configuration file, defaults to ~/.lis/config.toml");
 }
 
-/// Draw the interactive UI
-fn draw_ui(frame: &mut Frame, app_state: &AppState) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
-        .split(frame.size());
+fn unmount_fuse(mount_point: &Path) -> Result<()> {
+    use std::process::Command;
+    
+    // First try to kill any processes using the mount point
+    let lsof_output = Command::new("lsof")
+        .arg(mount_point)
+        .output();
 
-    // Title
-    let title = Paragraph::new("Lis Distributed Filesystem")
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, chunks[0]);
-
-    if app_state.show_status {
-        draw_cluster_status(frame, app_state, chunks[1]);
-    } else {
-        // Clusters list
-        let clusters: Vec<ListItem> = app_state.clusters
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let style = if Some(i) == app_state.selected_cluster {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default()
-                };
-                
-                // Add status color indicator
-                let status_color = app_state.cluster_status.get(name)
-                    .map(|status| match status {
-                        ClusterStatus::Offline => Color::Red,
-                        ClusterStatus::Degraded => Color::LightRed,
-                        ClusterStatus::NoQuorum => Color::Yellow,
-                        ClusterStatus::Healthy => Color::Green,
-                    })
-                    .unwrap_or(Color::White);
-                
-                let text = format!("● {}", name);
-                ListItem::new(text).style(style.fg(status_color))
-            })
-            .collect();
-
-        let clusters_list = List::new(clusters)
-            .block(Block::default().title("Clusters").borders(Borders::ALL));
-        frame.render_widget(clusters_list, chunks[1]);
-    }
-
-    // Status/help message
-    let help_text = if let Some(ref msg) = app_state.message {
-        msg.as_str()
-    } else if app_state.show_status {
-        "Press: (q) Back, (↑/↓) Scroll"
-    } else {
-        "Press: (q) Quit, (c) Create cluster, (s) Share cluster, (Enter) Show status, (↑/↓) Navigate"
-    };
-    let help = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(help, chunks[2]);
-}
-
-fn draw_cluster_status(frame: &mut Frame, app_state: &AppState, area: Rect) {
-    if let Some(selected) = app_state.selected_cluster {
-        let cluster_name = &app_state.clusters[selected];
-        
-        // Get cluster status
-        let status = app_state.cluster_status.get(cluster_name)
-            .cloned()
-            .unwrap_or(ClusterStatus::Offline);
-            
-        let status_str = match status {
-            ClusterStatus::Offline => "Offline",
-            ClusterStatus::Degraded => "Degraded",
-            ClusterStatus::NoQuorum => "No Quorum",
-            ClusterStatus::Healthy => "Healthy",
-        };
-        
-        let status_color = match status {
-            ClusterStatus::Offline => Color::Red,
-            ClusterStatus::Degraded => Color::LightRed,
-            ClusterStatus::NoQuorum => Color::Yellow,
-            ClusterStatus::Healthy => Color::Green,
-        };
-        
-        // Create status text
-        let mut text = vec![
-            format!("Cluster: {}", cluster_name),
-            format!("Status: {}", status_str),
-            String::new(),
-            "Nodes:".to_string(),
-        ];
-        
-        // Add node information
-        if let Ok(nodes) = tokio::runtime::Handle::current().block_on(app_state.get_cluster_nodes(cluster_name)) {
-            for node in nodes {
-                let node_status = match node.status {
-                    NodeStatus::Online => "Online",
-                    NodeStatus::Offline => "Offline",
-                    NodeStatus::Degraded => "Degraded",
-                };
-                
-                text.push(format!(
-                    "  {} - {} - Last seen: {}s ago - Latency: {:?}",
-                    node.peer_id,
-                    node_status,
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
-                        .saturating_sub(node.last_seen),
-                    node.latency.map(|d| d.as_millis()).unwrap_or(0)
-                ));
+    if let Ok(output) = lsof_output {
+        // Parse lsof output to get PIDs
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        for line in output_str.lines().skip(1) { // Skip header line
+            if let Some(pid_str) = line.split_whitespace().nth(1) {
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    // Try to kill the process
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                }
             }
         }
-        
-        let status_text = text.join("\n");
-        let paragraph = Paragraph::new(status_text)
-            .block(Block::default().title("Cluster Status").borders(Borders::ALL))
-            .style(Style::default().fg(status_color))
-            .scroll((app_state.status_scroll as u16, 0));
-            
-        frame.render_widget(paragraph, area);
     }
+
+    // Try fusermount first (Linux)
+    let status = Command::new("fusermount")
+        .arg("-u")
+        .arg("-z") // Lazy unmount
+        .arg(mount_point)
+        .status();
+
+    match status {
+        Ok(exit) if exit.success() => Ok(()),
+        _ => {
+            // Try lazy unmount with umount
+            let status = Command::new("umount")
+                .arg("-l")
+                .arg(mount_point)
+                .status();
+            
+            match status {
+                Ok(exit) if exit.success() => Ok(()),
+                _ => {
+                    // Last resort: force unmount
+                    if let Err(e) = mount::umount(mount_point) {
+                        Err(eyre!("Failed to unmount {}: {}", mount_point.display(), e))
+                } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Main entrypoint
+#[tokio::main]
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+    env_logger::init();
+
+    let args = Args::parse();
+
+    match args.command {
+        Some(Command::Daemon) => {
+            let mut app_state = AppState::new(args.config).await?;
+            app_state.init_p2p(true).await?;
+
+            // Keep the daemon running until interrupted
+            tokio::signal::ctrl_c().await?;
+            println!("Shutting down daemon...");
+        }
+        Some(Command::Ui) => {
+            let mut app_state = AppState::new(args.config).await?;
+            app_state.init_p2p(false).await?;
+
+            // Connect to the daemon
+            let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
+            if let Some(transport) = &app_state.transport {
+                let fut = transport.0.dial(addr, libp2p::core::transport::DialOpts::with_peer_id(app_state.peer_id))?;
+                match fut.await {
+                    Ok((peer_id, mut connection)) => {
+                        if let Ok(mut substream) = connection.open_outbound() {
+                            println!("Connected to daemon at {}", addr);
+                        }
+                    }
+                    Err(e) => println!("Failed to connect to daemon: {}", e),
+                }
+            }
+
+            // Load and display clusters
+            app_state.load_clusters().await?;
+            let clusters = app_state.clusters.read().await;
+            if clusters.is_empty() {
+                println!("No clusters found.");
+            } else {
+                println!("Available clusters:");
+                for cluster in clusters.iter() {
+                    let status = app_state.get_cluster_status(cluster).await?;
+                    let status_str = match status {
+                        ClusterStatus::Offline => "offline",
+                        ClusterStatus::Degraded => "degraded",
+                        ClusterStatus::NoQuorum => "no quorum",
+                        ClusterStatus::Healthy => "healthy",
+                        ClusterStatus::Connecting => "connecting",
+                    };
+                    println!("  - {} ({})", cluster, status_str);
+                }
+            }
+        }
+        Some(Command::Mount) => {
+            run_mount(args.config).await?;
+        }
+        Some(Command::Unmount) => {
+            run_unmount(args.config).await?;
+        }
+        Some(Command::Cluster(action)) => {
+            run_cluster(action, args.config).await?;
+        }
+        None => {
+            println!("No command specified. Use --help for usage information.");
+        }
+    }
+
+    Ok(())
 }
 
 /// Run the interactive CLI mode using ratatui.
 async fn run_interactive(config: Option<String>) -> Result<()> {
     let mut app_state = AppState::new(config).await?;
-    app_state.init_p2p().await?;
-    app_state.load_clusters()?;
+    app_state.load_clusters().await?;
+
+    // Set up transport with yamux for multiplexing
+    let local_key = identity::Keypair::generate_ed25519();
+    let transport = tcp::tokio::Transport::new(tcp::Config::default())
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise::Config::new(&local_key)?)
+        .multiplex(yamux::Config::default())
+        .boxed();
+
+    let transport_wrapper = TransportWrapper::new(transport);
+
+    // Set up background task to maintain daemon connection and status updates
+    let app_state_clone = app_state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            
+            // Try to connect to daemon
+            let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse().unwrap();
+            
+            if let Ok(fut) = transport_wrapper.0.dial(addr, libp2p::core::transport::DialOpts::with_peer_id(app_state_clone.peer_id)) {
+                if let Ok((peer_id, mut connection)) = fut.await {
+                    if let Ok(mut substream) = connection.open_outbound() {
+                        // Send status request
+                        let request = ClusterMessage::StatusRequest { 
+                            peer_id: app_state_clone.peer_id 
+                        };
+                        if let Ok(request_bytes) = serde_json::to_vec(&request) {
+                            if let Ok(()) = substream.write_all(&request_bytes).await {
+                                // Read response
+                                let mut buf = vec![0; 1024];
+                                if let Ok(n) = substream.read(&mut buf).await {
+                                    if let Ok(ClusterMessage::StatusResponse { clusters, .. }) = 
+                                        serde_json::from_slice(&buf[..n]) {
+                                        *app_state_clone.cluster_status.write().await = clusters;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -757,7 +722,8 @@ async fn run_interactive(config: Option<String>) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, app_state).await;
+    let app_state_clone = app_state.clone();
+    let result = run_app(&mut terminal, app_state_clone).await;
 
     disable_raw_mode()?;
     execute!(
@@ -775,170 +741,116 @@ async fn run_interactive(config: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    mut app_state: AppState,
-) -> Result<()> {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    let mut creating_cluster = false;
-    let mut cluster_name_input = String::new();
-    let mut sharing_cluster = false;
+/// Implementation for daemon mode
+async fn run_daemon(config: Option<String>) -> Result<()> {
+    let mut app_state = AppState::new(config).await?;
+    
+    // Set up transport with yamux for multiplexing
+    let local_key = identity::Keypair::generate_ed25519();
+    let peer_id = PeerId::from(local_key.public());
+    app_state.peer_id = peer_id;
 
-    loop {
-        terminal.draw(|f| ui(f, &app_state, &creating_cluster, &cluster_name_input, &sharing_cluster))?;
+    let transport = tcp::tokio::Transport::new(tcp::Config::default())
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise::Config::new(&local_key)?)
+        .multiplex(yamux::Config::default())
+        .boxed();
 
-        tokio::select! {
-            _ = interval.tick() => {
-                app_state.update_cluster_status().await?;
-            }
-            Ok(event) = tokio::task::spawn_blocking(|| crossterm::event::read()) => {
-                if let Ok(Event::Key(key)) = event {
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        break;
-                    }
+    // Create listener
+    let addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
+    let mut swarm = {
+        let store = MemoryStore::new(peer_id);
+        let behaviour = LisNetworkBehaviour {
+            kademlia: Kademlia::new(peer_id, store),
+        };
+        let mut swarm = Swarm::new(
+            transport,
+            behaviour,
+            peer_id,
+            SwarmConfig::with_tokio_executor(),
+        );
+        swarm.listen_on(addr)?;
+        swarm
+    };
+    println!("Listening for UI connections on 127.0.0.1:33033");
+    
+    // Load all existing clusters
+    app_state.load_clusters().await?;
+    let clusters = app_state.clusters.read().await.clone();
+    
+    if clusters.is_empty() {
+        println!("No clusters found. Create one first with 'lis cluster create <name>'");
+        return Ok(());
+    }
 
-                    if creating_cluster {
-                        match key.code {
-                            KeyCode::Enter => {
-                                if !cluster_name_input.is_empty() {
-                                    app_state.create_cluster(&cluster_name_input).await?;
-                                    creating_cluster = false;
-                                    cluster_name_input.clear();
-                                }
-                            }
-                            KeyCode::Esc => {
-                                creating_cluster = false;
-                                cluster_name_input.clear();
-                            }
-                            KeyCode::Char(c) => {
-                                cluster_name_input.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                cluster_name_input.pop();
-                            }
-                            _ => {}
-                        }
-                    } else if sharing_cluster {
-                        match key.code {
-                            KeyCode::Esc => {
-                                sharing_cluster = false;
-                            }
-                            _ => {}
-                        }
-                    } else if app_state.show_status {
-                        match key.code {
-                            KeyCode::Char('q') => {
-                                app_state.show_status = false;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Up => {
-                                if let Some(selected) = app_state.selected_cluster {
-                                    if selected > 0 {
-                                        app_state.selected_cluster = Some(selected - 1);
-                                    }
-                                } else if !app_state.clusters.is_empty() {
-                                    app_state.selected_cluster = Some(0);
-                                }
-                            }
-                            KeyCode::Down => {
-                                if let Some(selected) = app_state.selected_cluster {
-                                    if selected < app_state.clusters.len().saturating_sub(1) {
-                                        app_state.selected_cluster = Some(selected + 1);
-                                    }
-                                } else if !app_state.clusters.is_empty() {
-                                    app_state.selected_cluster = Some(0);
-                                }
-                            }
-                            KeyCode::Char('c') => {
-                                creating_cluster = true;
-                            }
-                            KeyCode::Char('s') => {
-                                if app_state.selected_cluster.is_some() {
-                                    sharing_cluster = true;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if app_state.selected_cluster.is_some() {
-                                    app_state.show_status = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+    println!("Initializing clusters:");
+    for cluster_name in clusters {
+        println!("  - Loading cluster: {}", cluster_name);
+        
+        // Initialize cluster state
+        if let Err(e) = app_state.load_cluster_state(&cluster_name).await {
+            eprintln!("Error loading cluster {}: {}", cluster_name, e);
+            continue;
+        }
+
+        // Initialize cluster state with a single node (self)
+        let mut cluster_state = ClusterState {
+            name: cluster_name.clone(),
+            nodes: HashMap::new(),
+            last_updated: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_secs(),
+        };
+
+        // Add self as a node
+        let node_addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
+        cluster_state.nodes.insert(app_state.peer_id, NodeInfo {
+            peer_id: app_state.peer_id,
+            addr: node_addr,
+            status: NodeStatus::Online,
+            last_seen: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_secs(),
+            latency: None,
+        });
+
+        // Update cluster status
+        let mut status = app_state.cluster_status.write().await;
+        status.insert(cluster_name.clone(), ClusterStatus::Healthy);
+    }
+
+    let app_state = Arc::new(app_state);
+    let _app_state_clone = Arc::clone(&app_state);
+
+    // Handle UI client connections
+    tokio::spawn(async move {
+        loop {
+            if let Some(event) = swarm.next().await {
+                match event {
+                    // Handle swarm events
+                    _ => {}
                 }
             }
+        }
+    });
+
+    println!("\nDaemon running. Press Ctrl+C to stop.");
+    println!("Use 'lis mount' in another terminal to mount clusters.");
+    
+    // Set up Ctrl-C handler
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    
+    // Keep the daemon running until Ctrl+C
+    tokio::select! {
+        _ = sigint.recv() => {
+            println!("\nShutting down...");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nShutting down...");
         }
     }
 
     Ok(())
-}
-
-/// Draw the cluster creation UI
-fn draw_create_cluster_ui(frame: &mut Frame, input: &str) {
-    let area = centered_rect(60, 20, frame.size());
-    
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-        ])
-        .margin(1)
-        .split(area);
-
-    let title = Paragraph::new("Create New Cluster")
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, chunks[0]);
-
-    let input = Paragraph::new(input)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title("Enter cluster name (Enter to confirm, Esc to cancel)"));
-    frame.render_widget(input, chunks[1]);
-}
-
-/// Draw the cluster sharing UI
-fn draw_share_cluster_ui(frame: &mut Frame, app_state: &AppState) {
-    let area = centered_rect(60, 20, frame.size());
-    
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-        ])
-        .margin(1)
-        .split(area);
-
-    let title = Paragraph::new("Share Cluster")
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, chunks[0]);
-
-    let selected_cluster = app_state.selected_cluster
-        .and_then(|i| app_state.clusters.get(i));
-        
-    let content = if let Some(_) = selected_cluster {
-        if let Some(node) = &app_state.p2p_node {
-            match node.share_token() {
-                Ok(token) => format!("Share this token: {}", token),
-                Err(_) => "Failed to generate share token".to_string(),
-            }
-        } else {
-            "P2P node not initialized".to_string()
-        }
-    } else {
-        "No cluster selected".to_string()
-    };
-
-    let message = Paragraph::new(content)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title("Press Esc to close"));
-    frame.render_widget(message, chunks[1]);
 }
 
 /// Helper function to create a centered rect
@@ -949,7 +861,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
             Constraint::Percentage(percent_y),
             Constraint::Percentage((100 - percent_y) / 2),
-        ])
+        ].as_ref())
         .split(r);
 
     Layout::default()
@@ -962,41 +874,200 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Main entrypoint
-#[tokio::main]
-async fn main() -> Result<()> {
-    color_eyre::install()?;
-    let args: Vec<String> = env::args().collect();
-    match process_args(&args) {
-        CliCommand::Help => {
-            print_help();
-            Ok(())
-        },
-        CliCommand::Interactive { config } => run_interactive(config).await,
-        CliCommand::Daemon { config } => run_daemon(config).await,
-        CliCommand::Cluster { action, config } => run_cluster(action, config).await,
-        CliCommand::Mount { config } => run_mount(config).await,
-        CliCommand::Unmount { config } => run_unmount(config).await,
+/// Messages exchanged between nodes in a cluster
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum ClusterMessage {
+    StatusRequest {
+        peer_id: PeerId,
+    },
+    StatusResponse {
+        clusters: HashMap<String, ClusterStatus>,
+        peer_id: PeerId,
+    },
+}
+
+impl ClusterMessage {
+    fn cluster_name(&self) -> String {
+        match self {
+            ClusterMessage::StatusRequest { .. } => "status".to_string(),
+            ClusterMessage::StatusResponse { .. } => "status".to_string(),
+        }
     }
 }
 
-/// Implementation for daemon mode
-async fn run_daemon(config: Option<String>) -> Result<()> {
-    let mut app_state = AppState::new(config).await?;
-    app_state.init_p2p().await?;
-    println!("Daemon mode using config: {}", app_state.config_path.display());
-    println!("Running daemon mode... (not fully implemented)");
-    
-    // Keep the daemon running
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+fn parse_token(token: &str) -> Result<(Multiaddr, String)> {
+    let parts: Vec<&str> = token.split('@').collect();
+    if parts.len() != 2 {
+        return Err(eyre!("Invalid token format - expected format: <cluster_id>@<multiaddr>"));
     }
+
+    let cluster_id = parts[0].to_string();
+    let addr: Multiaddr = parts[1].parse()
+        .map_err(|_| eyre!("Invalid multiaddr in token"))?;
+
+    Ok((addr, cluster_id))
+}
+
+#[derive(Debug, Clone)]
+struct Cluster {
+    id: String,
+    name: String,
+    dir: PathBuf,
+    peers: HashSet<PeerId>,
+    status: ClusterStatus,
+    nodes: HashMap<PeerId, NodeInfo>,
+    last_updated: u64,
+}
+
+async fn run_app<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    mut app_state: AppState,
+) -> Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    
+    // Set up Ctrl-C handler
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    
+    loop {
+        // Draw UI
+        terminal.draw(|f| {
+            let size = f.size();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                    Constraint::Length(3),
+                ].as_ref())
+                .split(size);
+
+            // Draw title
+            let title = Paragraph::new("Lis Distributed Filesystem")
+                .alignment(ratatui::layout::Alignment::Center);
+            f.render_widget(title, chunks[0]);
+
+            // Draw clusters list
+            let items: Vec<ListItem> = if let Ok(clusters) = app_state.clusters.try_read() {
+                clusters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let status = app_state.cluster_status
+                            .try_read()
+                            .ok()
+                            .and_then(|status| {
+                                status.get(name).cloned()
+                            })
+                            .unwrap_or(ClusterStatus::Offline);
+                        let status_str = match status {
+                            ClusterStatus::Offline => "offline",
+                            ClusterStatus::Degraded => "degraded",
+                            ClusterStatus::NoQuorum => "no quorum",
+                            ClusterStatus::Healthy => "healthy",
+                            ClusterStatus::Connecting => "connecting",
+                        };
+                        let selected = app_state.selected_cluster == Some(i);
+                        let style = if selected {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default()
+                        };
+                        ListItem::new(format!("{} ({})", name, status_str)).style(style)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let clusters_list = List::new(items)
+                .block(Block::default().title("Clusters").borders(Borders::ALL))
+                .highlight_style(Style::default().fg(Color::Yellow));
+            f.render_widget(clusters_list, chunks[1]);
+
+            // Draw status bar
+            let status = match app_state.input_mode {
+                InputMode::Normal => "Press 'i' to enter input mode, 'q' to quit",
+                InputMode::Editing => "Press Esc to exit input mode",
+            };
+            let status_bar = Paragraph::new(status)
+                .alignment(ratatui::layout::Alignment::Left);
+            f.render_widget(status_bar, chunks[2]);
+        })?;
+
+        tokio::select! {
+            _ = interval.tick() => {
+                app_state.update_cluster_status().await?;
+            }
+            _ = sigint.recv() => {
+                break;
+            }
+            Ok(event) = tokio::task::spawn_blocking(|| crossterm::event::read()) => {
+                if let Ok(event) = event {
+                    if let crossterm::event::Event::Key(key) = event {
+                        if key.code == KeyCode::Char('c') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                            break;
+                        }
+                        if let Err(e) = app_state.handle_input(key) {
+                            eprintln!("Error handling input: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Network behavior for the Lis application
+#[derive(NetworkBehaviour)]
+struct LisNetworkBehaviour {
+    kademlia: Kademlia<MemoryStore>,
+}
+
+/// Cluster state
+#[derive(Debug, Clone)]
+struct ClusterState {
+    name: String,
+    nodes: HashMap<PeerId, NodeInfo>,
+    last_updated: u64,
+}
+
+/// Node information
+#[derive(Debug, Clone)]
+struct NodeInfo {
+    peer_id: PeerId,
+    addr: Multiaddr,
+    status: NodeStatus,
+    last_seen: u64,
+    latency: Option<Duration>,
+}
+
+/// Node status
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum NodeStatus {
+    Online,
+    Offline,
+    Degraded,
+    Connecting,
+}
+
+/// Cluster status
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum ClusterStatus {
+    Offline,
+    Degraded,
+    NoQuorum,
+    Healthy,
+    Connecting,
 }
 
 /// Implementation for cluster commands
 async fn run_cluster(action: ClusterAction, config: Option<String>) -> Result<()> {
     let mut app_state = AppState::new(config).await?;
-    app_state.init_p2p().await?;
+    app_state.init_p2p(false).await?;
     
     match action {
         ClusterAction::Create { name } => {
@@ -1005,26 +1076,28 @@ async fn run_cluster(action: ClusterAction, config: Option<String>) -> Result<()
         }
         ClusterAction::Join { cluster, ticket } => {
             if let Some(token) = ticket {
-                app_state.join_cluster(&cluster, &token).await?;
+                app_state.join_cluster(cluster, token).await?;
             } else if let Ok(token) = env::var("LIS_TICKET") {
-                app_state.join_cluster(&cluster, &token).await?;
+                app_state.join_cluster(cluster, token).await?;
             } else {
                 return Err(eyre!("No join ticket provided. Use --ticket or set LIS_TICKET environment variable."));
             }
         }
         ClusterAction::List => {
-            app_state.load_clusters()?;
-            if app_state.clusters.is_empty() {
+            app_state.load_clusters().await?;
+            let clusters = app_state.clusters.read().await;
+            if clusters.is_empty() {
                 println!("No clusters found.");
             } else {
                 println!("Available clusters:");
-                for cluster in &app_state.clusters {
+                for cluster in clusters.iter() {
                     let status = app_state.get_cluster_status(cluster).await?;
                     let status_str = match status {
                         ClusterStatus::Offline => "offline",
                         ClusterStatus::Degraded => "degraded",
                         ClusterStatus::NoQuorum => "no quorum",
                         ClusterStatus::Healthy => "healthy",
+                        ClusterStatus::Connecting => "connecting",
                     };
                     println!("  - {} ({})", cluster, status_str);
                 }
@@ -1037,42 +1110,21 @@ async fn run_cluster(action: ClusterAction, config: Option<String>) -> Result<()
 /// Implementation for mounting the filesystem
 async fn run_mount(config: Option<String>) -> Result<()> {
     let mut app_state = AppState::new(config).await?;
-    app_state.init_p2p().await?;
     
-    // List available clusters and prompt user to select one
-    let clusters = app_state.clusters.clone();
-    if clusters.is_empty() {
-        return Err(eyre!("No clusters available. Create one first with 'lis cluster create <name>'"));
-    }
-    
-    println!("Available clusters:");
-    for (i, cluster) in clusters.iter().enumerate() {
-        let status = app_state.get_cluster_status(cluster).await?;
-        let status_str = match status {
-            ClusterStatus::Offline => "offline",
-            ClusterStatus::Degraded => "degraded",
-            ClusterStatus::NoQuorum => "no quorum",
-            ClusterStatus::Healthy => "healthy",
-        };
-        println!("  {}. {} ({})", i + 1, cluster, status_str);
-    }
-    
-    print!("Select cluster number (1-{}): ", clusters.len());
-    std::io::stdout().flush()?;
-    
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let selection = input.trim().parse::<usize>()
-        .map_err(|_| eyre!("Invalid selection"))
-        .and_then(|n| {
-            if n > 0 && n <= clusters.len() {
-                Ok(n - 1)
-            } else {
-                Err(eyre!("Selection out of range"))
-            }
-        })?;
-    
-    let cluster_name = clusters[selection].clone();
+    // Initialize basic P2P
+    let local_key = identity::Keypair::generate_ed25519();
+    let peer_id = PeerId::from(local_key.public());
+    app_state.peer_id = peer_id;
+
+    let _transport = tcp::tokio::Transport::new(tcp::Config::default())
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise::Config::new(&local_key)?)
+        .multiplex(yamux::Config::default())
+        .boxed();
+
+    // Connect directly to the local daemon
+    let daemon_addr: Multiaddr = "/ip4/127.0.0.1/tcp/33033".parse()?;
+    println!("Connecting to daemon at {}", daemon_addr);
     
     // Get mount point
     print!("Enter mount point: ");
@@ -1088,10 +1140,11 @@ async fn run_mount(config: Option<String>) -> Result<()> {
     }
     
     // Initialize FUSE filesystem
-    let fs = LisFs::new(app_state, cluster_name)?;
+    let fs = LisFs::new(app_state, "default".to_string())?;
     
     // Mount the filesystem
     let options = vec![MountOption::RO, MountOption::FSName("lis".to_string())];
+    println!("Mounting filesystem...");
     fuser::mount2(fs, &mount_point, &options)?;
     
     Ok(())
@@ -1100,676 +1153,159 @@ async fn run_mount(config: Option<String>) -> Result<()> {
 /// Implementation for unmounting the filesystem
 async fn run_unmount(config: Option<String>) -> Result<()> {
     let mut app_state = AppState::new(config).await?;
-    app_state.init_p2p().await?;
+    app_state.init_p2p(false).await?;
     println!("Unmounting filesystem using config: {}", app_state.config_path.display());
     println!("Unmounting filesystem... (not fully implemented)");
     Ok(())
 }
 
+/// FUSE filesystem implementation
 struct LisFs {
-    app_state: AppState,
-    inode_to_attr: HashMap<u64, FileAttr>,
+    app_state: Arc<AppState>,
+    cluster: String,
 }
 
 impl LisFs {
-    fn new(mut app_state: AppState, cluster_name: String) -> Result<Self> {
-        app_state.load_cluster_state(&cluster_name)?;
-        Ok(LisFs {
-            app_state,
-            inode_to_attr: HashMap::new(),
+    fn new(app_state: AppState, cluster: String) -> Result<Self> {
+        Ok(Self {
+            app_state: Arc::new(app_state),
+            cluster,
         })
-    }
-
-    fn get_attr_from_metadata(&self, metadata: &MetadataDoc) -> FileAttr {
-        let now = SystemTime::now();
-        FileAttr {
-            ino: metadata.inode_uuid.as_u64_pair().0,
-            size: metadata.size,
-            blocks: (metadata.size + 511) / 512,
-            atime: now,
-            mtime: UNIX_EPOCH + Duration::from_secs(metadata.modified),
-            ctime: now,
-            crtime: now,
-            kind: match metadata.doc_type {
-                DocType::Directory => FileType::Directory,
-                DocType::File => FileType::RegularFile,
-            },
-            perm: 0o755,
-            nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            flags: 0,
-            blksize: 512,
-        }
     }
 }
 
 impl Filesystem for LisFs {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent_id = if parent == FUSE_ROOT_ID {
-            if let Some(root_doc) = &self.app_state.root_doc {
-                &root_doc.top_level_directory
-            } else {
-                reply.error(ENOENT);
-                return;
+    fn lookup(&mut self, _req: &Request<'_>, _parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let path = PathBuf::from(name);
+        match self.app_state.get_inode(&path) {
+            Ok(inode) => {
+                let ttl = Duration::from_secs(1);
+                let attr = FileAttr {
+                    ino: inode,
+                    size: 0,
+                    blocks: 0,
+                    atime: SystemTime::now(),
+                    mtime: SystemTime::now(),
+                    ctime: SystemTime::now(),
+                    crtime: SystemTime::now(),
+                    kind: FileType::RegularFile,
+                    perm: 0o644,
+                    nlink: 1,
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                    flags: 0,
+                    blksize: 512,
+                };
+                reply.entry(&ttl, &attr, 0);
             }
-        } else {
-            // TODO: Implement lookup for non-root directories
-            reply.error(ENOENT);
-            return;
+            Err(_e) => {
+                reply.error(libc::ENOENT);
+            }
+        }
+    }
+
+    fn getattr(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyAttr) {
+        let ttl = Duration::from_secs(1);
+        let attr = FileAttr {
+            ino: 1,
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::now(),
+            mtime: SystemTime::now(),
+            ctime: SystemTime::now(),
+            crtime: SystemTime::now(),
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: 1000,
+            gid: 1000,
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
         };
-
-        // Get parent directory
-        let parent_dir_bytes = match self.app_state.get_document(parent_id) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let parent_dir: DirectoryDoc = match serde_json::from_slice(&parent_dir_bytes) {
-            Ok(dir) => dir,
-            Err(_) => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        // Get children
-        let children_bytes = match self.app_state.get_document(&parent_dir.children) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let children: ChildrenDoc = match serde_json::from_slice::<ChildrenDoc>(&children_bytes) {
-            Ok(children) => children,
-            Err(_) => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        // Find matching entry
-        let name = name.to_str().unwrap_or("");
-        for entry in children.entries {
-            match entry {
-                DirectoryEntry::File { name: ref entry_name, file_doc } if entry_name == name => {
-                    let file_bytes = match self.app_state.get_document(&file_doc) {
-                        Ok(bytes) => bytes,
-                        Err(_) => continue,
-                    };
-                    let file: FileDoc = match serde_json::from_slice::<FileDoc>(&file_bytes) {
-                        Ok(file) => file,
-                        Err(_) => continue,
-                    };
-                    let metadata_bytes = match self.app_state.get_document(&file.metadata) {
-                        Ok(bytes) => bytes,
-                        Err(_) => continue,
-                    };
-                    let metadata: MetadataDoc = match serde_json::from_slice::<MetadataDoc>(&metadata_bytes) {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
-                    let attr = self.get_attr_from_metadata(&metadata);
-                    reply.entry(&Duration::from_secs(1), &attr, 0);
-                    return;
-                }
-                DirectoryEntry::Folder { name: ref entry_name, directory_doc } if entry_name == name => {
-                    let dir_bytes = match self.app_state.get_document(&directory_doc) {
-                        Ok(bytes) => bytes,
-                        Err(_) => continue,
-                    };
-                    let dir: DirectoryDoc = match serde_json::from_slice::<DirectoryDoc>(&dir_bytes) {
-                        Ok(dir) => dir,
-                        Err(_) => continue,
-                    };
-                    let metadata_bytes = match self.app_state.get_document(&dir.metadata) {
-                        Ok(bytes) => bytes,
-                        Err(_) => continue,
-                    };
-                    let metadata: MetadataDoc = match serde_json::from_slice::<MetadataDoc>(&metadata_bytes) {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
-                    let attr = self.get_attr_from_metadata(&metadata);
-                    reply.entry(&Duration::from_secs(1), &attr, 0);
-                    return;
-                }
-                _ => continue,
-            }
-        }
-        reply.error(ENOENT);
+        reply.attr(&ttl, &attr);
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        if ino == FUSE_ROOT_ID {
-            if let Some(root_doc) = &self.app_state.root_doc {
-                if let Ok(dir_bytes) = self.app_state.get_document(&root_doc.top_level_directory) {
-                    if let Ok(dir) = serde_json::from_slice::<DirectoryDoc>(&dir_bytes) {
-                        if let Ok(metadata_bytes) = self.app_state.get_document(&dir.metadata) {
-                            if let Ok(metadata) = serde_json::from_slice::<MetadataDoc>(&metadata_bytes) {
-                                let attr = self.get_attr_from_metadata(&metadata);
-                                reply.attr(&Duration::from_secs(1), &attr);
-                                return;
-                            }
-                        }
-                    }
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyData,
+    ) {
+        match self.app_state.get_document(ino) {
+            Ok(data) => {
+                let start = offset as usize;
+                let end = (offset as usize + size as usize).min(data.len());
+                if start >= data.len() {
+                    reply.data(&[]);
+                } else {
+                    reply.data(&data[start..end]);
                 }
             }
-        }
-
-        // For non-root inodes, look up in the inode map
-        if let Some(attr) = self.inode_to_attr.get(&ino) {
-            reply.attr(&Duration::from_secs(1), attr);
-            return;
-        }
-
-        reply.error(ENOENT);
-    }
-
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
-        // Get the document ID for this inode from the inode map
-        if let Some(root_doc) = &self.app_state.root_doc {
-            if let Ok(inode_map_bytes) = self.app_state.get_document(&root_doc.inode_map) {
-                if let Ok(inode_map) = serde_json::from_slice::<InodeMapDoc>(&inode_map_bytes) {
-                    let inode_uuid = Uuid::from_u64_pair(ino, 0);
-                    if let Some(doc_id) = inode_map.inode_to_doc.get(&inode_uuid) {
-                        // Get the file document
-                        if let Ok(file_bytes) = self.app_state.get_document(doc_id) {
-                            if let Ok(file) = serde_json::from_slice::<FileDoc>(&file_bytes) {
-                                // Get the file content from chunks
-                                if let Some(chunk_id) = file.chunks.first() {
-                                    if let Ok(content) = self.app_state.get_document(chunk_id) {
-                                        let content_len = content.len() as i64;
-                                        if offset < content_len {
-                                            let start = offset as usize;
-                                            let end = std::cmp::min(
-                                                (offset + size as i64) as usize,
-                                                content.len()
-                                            );
-                                            reply.data(&content[start..end]);
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        reply.error(ENOENT);
-    }
-
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(ENOENT);
-            return;
-        }
-
-        if let Some(root_doc) = &self.app_state.root_doc {
-            if let Ok(dir_bytes) = self.app_state.get_document(&root_doc.top_level_directory) {
-                if let Ok(dir) = serde_json::from_slice::<DirectoryDoc>(&dir_bytes) {
-                    if let Ok(children_bytes) = self.app_state.get_document(&dir.children) {
-                        if let Ok(children) = serde_json::from_slice::<ChildrenDoc>(&children_bytes) {
-                            let mut entries = vec![
-                                (FUSE_ROOT_ID, FileType::Directory, ".".to_string()),
-                                (FUSE_ROOT_ID, FileType::Directory, "..".to_string()),
-                            ];
-
-                            for entry in children.entries {
-                                match entry {
-                                    DirectoryEntry::File { name, file_doc } => {
-                                        if let Ok(file_bytes) = self.app_state.get_document(&file_doc) {
-                                            if let Ok(file) = serde_json::from_slice::<FileDoc>(&file_bytes) {
-                                                if let Ok(metadata_bytes) = self.app_state.get_document(&file.metadata) {
-                                                    if let Ok(metadata) = serde_json::from_slice::<MetadataDoc>(&metadata_bytes) {
-                                                        entries.push((
-                                                            metadata.inode_uuid.as_u64_pair().0,
-                                                            FileType::RegularFile,
-                                                            name,
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    DirectoryEntry::Folder { name, directory_doc } => {
-                                        if let Ok(dir_bytes) = self.app_state.get_document(&directory_doc) {
-                                            if let Ok(dir) = serde_json::from_slice::<DirectoryDoc>(&dir_bytes) {
-                                                if let Ok(metadata_bytes) = self.app_state.get_document(&dir.metadata) {
-                                                    if let Ok(metadata) = serde_json::from_slice::<MetadataDoc>(&metadata_bytes) {
-                                                        entries.push((
-                                                            metadata.inode_uuid.as_u64_pair().0,
-                                                            FileType::Directory,
-                                                            name,
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-                                if reply.add(ino, (i + 1) as i64, kind, &name) {
-                                    break;
-                                }
-                            }
-
-                            reply.ok();
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        reply.error(ENOENT);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    async fn setup_test_cluster() -> Result<(TempDir, AppState)> {
-        let temp_dir = TempDir::new().unwrap();
-        let mut app = AppState::new(Some(temp_dir.path().join("config.toml").to_string_lossy().into_owned())).await?;
-        app.create_cluster("test_cluster").await?;
-        Ok((temp_dir, app))
-    }
-
-    #[tokio::test]
-    async fn test_cluster_creation() -> Result<()> {
-        let (_temp_dir, app) = setup_test_cluster().await?;
-        assert!(app.root_doc.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_create_file() -> Result<()> {
-        let (_temp_dir, mut app) = setup_test_cluster().await?;
-        let top_level_directory = app.root_doc.as_ref().unwrap().top_level_directory.clone();
-        let file_id = app.create_file(&top_level_directory, "test.txt", b"Hello, World!".to_vec())?;
-        
-        // Verify file exists
-        let file_bytes = app.get_document(&file_id)?;
-        let file: FileDoc = serde_json::from_slice(&file_bytes)?;
-        let content = app.get_document(&file.chunks[0])?;
-        assert_eq!(content, b"Hello, World!".to_vec());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_create_multiple_files() -> Result<()> {
-        let (_temp_dir, mut app) = setup_test_cluster().await?;
-        let top_level_directory = app.root_doc.as_ref().unwrap().top_level_directory.clone();
-        
-        // Create multiple files
-        app.create_file(&top_level_directory, "file1.txt", b"Content 1".to_vec())?;
-        app.create_file(&top_level_directory, "file2.txt", b"Content 2".to_vec())?;
-        app.create_file(&top_level_directory, "file3.txt", b"Content 3".to_vec())?;
-
-        // Verify directory contents
-        let dir_bytes = app.get_document(&top_level_directory)?;
-        let dir: DirectoryDoc = serde_json::from_slice(&dir_bytes)?;
-        let children_bytes = app.get_document(&dir.children)?;
-        let children: ChildrenDoc = serde_json::from_slice::<ChildrenDoc>(&children_bytes)?;
-
-        let file_names: Vec<String> = children.entries.iter().filter_map(|entry| {
-            match entry {
-                DirectoryEntry::File { name, .. } => Some(name.clone()),
-                _ => None,
-            }
-        }).collect();
-
-        assert_eq!(file_names.len(), 3);
-        assert!(file_names.contains(&"file1.txt".to_string()));
-        assert!(file_names.contains(&"file2.txt".to_string()));
-        assert!(file_names.contains(&"file3.txt".to_string()));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_large_file() -> Result<()> {
-        let (_temp_dir, mut app) = setup_test_cluster().await?;
-        let top_level_directory = app.root_doc.as_ref().unwrap().top_level_directory.clone();
-        
-        // Create a large file (1MB)
-        let large_content = vec![42u8; 1024 * 1024];
-        let file_id = app.create_file(&top_level_directory, "large.bin", large_content.clone())?;
-
-        // Verify file content
-        let file_bytes = app.get_document(&file_id)?;
-        let file: FileDoc = serde_json::from_slice(&file_bytes)?;
-        let content = app.get_document(&file.chunks[0])?;
-        assert_eq!(content, large_content);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_inode_mapping() -> Result<()> {
-        let (_temp_dir, mut app) = setup_test_cluster().await?;
-        let top_level_directory = app.root_doc.as_ref().unwrap().top_level_directory.clone();
-        let inode_map_id = app.root_doc.as_ref().unwrap().inode_map.clone();
-        
-        // Create a file
-        let file_id = app.create_file(&top_level_directory, "test.txt", b"Test content".to_vec())?;
-
-        // Verify inode mapping
-        let inode_map_bytes = app.get_document(&inode_map_id)?;
-        let inode_map: InodeMapDoc = serde_json::from_slice(&inode_map_bytes)?;
-
-        // Check that the file is in the inode map
-        assert!(inode_map.doc_to_inode.contains_key(&file_id));
-        let inode_uuid = inode_map.doc_to_inode[&file_id];
-        assert_eq!(inode_map.inode_to_doc[&inode_uuid], file_id);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_file_metadata() -> Result<()> {
-        let (_temp_dir, mut app) = setup_test_cluster().await?;
-        let top_level_directory = app.root_doc.as_ref().unwrap().top_level_directory.clone();
-        
-        let content = b"Test content".to_vec();
-        let file_id = app.create_file(&top_level_directory, "test.txt", content.clone())?;
-
-        // Get file metadata
-        let file_bytes = app.get_document(&file_id)?;
-        let file: FileDoc = serde_json::from_slice(&file_bytes)?;
-        let metadata_bytes = app.get_document(&file.metadata)?;
-        let metadata: MetadataDoc = serde_json::from_slice(&metadata_bytes)?;
-
-        assert_eq!(metadata.name, "test.txt");
-        assert_eq!(metadata.doc_type, DocType::File);
-        assert_eq!(metadata.size, content.len() as u64);
-        assert!(metadata.hash.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_root_directory_structure() -> Result<()> {
-        let (_temp_dir, app) = setup_test_cluster().await?;
-        let root_doc = app.root_doc.as_ref().unwrap();
-
-        // Verify root directory structure
-        let dir_bytes = app.get_document(&root_doc.top_level_directory)?;
-        let dir: DirectoryDoc = serde_json::from_slice(&dir_bytes)?;
-        
-        // Check metadata
-        let metadata_bytes = app.get_document(&dir.metadata)?;
-        let metadata: MetadataDoc = serde_json::from_slice(&metadata_bytes)?;
-        assert_eq!(metadata.name, "/");
-        assert_eq!(metadata.doc_type, DocType::Directory);
-
-        // Check children
-        let children_bytes = app.get_document(&dir.children)?;
-        let children: ChildrenDoc = serde_json::from_slice::<ChildrenDoc>(&children_bytes)?;
-        assert!(children.entries.is_empty()); // Root directory should start empty
-        Ok(())
-    }
-}
-
-// P2P types
-#[derive(NetworkBehaviour)]
-struct LisNetworkBehaviour {
-    kademlia: KademliaProtocol<MemoryStore>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterState {
-    name: String,
-    nodes: HashMap<PeerId, NodeInfo>,
-    last_updated: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodeInfo {
-    peer_id: PeerId,
-    addr: String,
-    status: NodeStatus,
-    last_seen: u64,
-    latency: Option<Duration>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-enum NodeStatus {
-    Online,
-    Offline,
-    Degraded,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum ClusterStatus {
-    Offline,
-    Degraded,
-    NoQuorum,
-    Healthy,
-}
-
-impl fmt::Debug for P2PNode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("P2PNode")
-            .field("peer_id", &self.peer_id)
-            .field("clusters", &self.clusters)
-            .finish()
-    }
-}
-
-struct P2PNode {
-    swarm: Swarm<LisNetworkBehaviour>,
-    peer_id: PeerId,
-    clusters: Arc<RwLock<HashMap<String, ClusterState>>>,
-}
-
-impl P2PNode {
-    async fn new() -> Result<Self> {
-        let local_key = identity::Keypair::generate_ed25519();
-        let peer_id = PeerId::from(local_key.public());
-
-        let transport = tcp::tokio::Transport::new(tcp::Config::default())
-            .upgrade(upgrade::Version::V1)
-            .authenticate(noise::Config::new(&local_key)?)
-            .multiplex(yamux::Config::default())
-            .boxed();
-
-        let mut swarm = Swarm::new(
-            transport,
-            LisNetworkBehaviour {
-                kademlia: {
-                    let mut kad = KademliaProtocol::new(peer_id, MemoryStore::new(peer_id));
-                    kad.set_mode(Some(KademliaMode::Server));
-                    kad
-                },
-            },
-            peer_id,
-            SwarmConfig::with_tokio_executor(),
-        );
-
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-
-        Ok(Self {
-            swarm,
-            peer_id,
-            clusters: Arc::new(RwLock::new(HashMap::new())),
-        })
-    }
-
-    async fn create_cluster(&self, name: &str) -> Result<String> {
-        let mut clusters = self.clusters.write().await;
-        let state = ClusterState {
-            name: name.to_string(),
-            nodes: {
-                let mut nodes = HashMap::new();
-                nodes.insert(self.peer_id, NodeInfo {
-                    peer_id: self.peer_id,
-                    addr: self.swarm.listeners().next().unwrap().to_string(),
-                    status: NodeStatus::Online,
-                    last_seen: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                    latency: None,
-                });
-                nodes
-            },
-            last_updated: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        };
-        clusters.insert(name.to_string(), state);
-
-        let token = format!("{}:{}", self.peer_id, self.swarm.listeners().next().unwrap());
-        Ok(STANDARD.encode(token))
-    }
-
-    async fn join_cluster(&mut self, name: &str, token: &str) -> Result<()> {
-        let decoded = String::from_utf8(STANDARD.decode(token)?)?;
-        let mut parts = decoded.split(':');
-        let bootstrap_peer = parts.next().ok_or_else(|| eyre!("Invalid token format"))?.parse()?;
-        let bootstrap_addr: Multiaddr = parts.next().ok_or_else(|| eyre!("Invalid token format"))?.parse()?;
-
-        // Add the bootstrap peer to the routing table
-        self.swarm.behaviour_mut().kademlia.add_address(&bootstrap_peer, bootstrap_addr.clone());
-
-        // Dial the bootstrap peer
-        self.swarm.dial(bootstrap_addr.clone())?;
-
-        // Start the bootstrap process
-        self.swarm.behaviour_mut().kademlia.bootstrap()?;
-
-        // Create initial cluster state
-        let mut clusters = self.clusters.write().await;
-        let state = ClusterState {
-            name: name.to_string(),
-            nodes: {
-                let mut nodes = HashMap::new();
-                nodes.insert(self.peer_id, NodeInfo {
-                    peer_id: self.peer_id,
-                    addr: self.swarm.listeners().next().unwrap().to_string(),
-                    status: NodeStatus::Online,
-                    last_seen: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                    latency: None,
-                });
-                nodes.insert(bootstrap_peer, NodeInfo {
-                    peer_id: bootstrap_peer,
-                    addr: bootstrap_addr.to_string(),
-                    status: NodeStatus::Online,
-                    last_seen: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                    latency: None,
-                });
-                nodes
-            },
-            last_updated: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        };
-        clusters.insert(name.to_string(), state);
-
-        Ok(())
-    }
-
-    fn share_token(&self) -> Result<String> {
-        let listeners = self.swarm.listeners().collect::<Vec<_>>();
-        if let Some(addr) = listeners.first() {
-            let token = format!("{}:{}", self.peer_id, addr);
-            Ok(STANDARD.encode(token))
-        } else {
-            Err(eyre!("No active listeners"))
-        }
-    }
-
-    async fn get_cluster_nodes(&self, cluster: &str) -> Result<Vec<NodeInfo>> {
-        let clusters = self.clusters.read().await;
-        if let Some(state) = clusters.get(cluster) {
-            Ok(state.nodes.values().cloned().collect())
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    async fn handle_swarm_event(&self, event: LisNetworkBehaviourEvent) -> Result<(), Box<dyn std::error::Error>> {
-        match event {
-            LisNetworkBehaviourEvent::Kademlia(kad_event) => {
-                if let KademliaEvent::OutboundQueryProgressed { result, .. } = kad_event {
-                    if let QueryResult::GetRecord(Ok(get_record)) = result {
-                        match get_record {
-                            GetRecordOk::FoundRecord(PeerRecord { record, .. }) => {
-                                let value = String::from_utf8_lossy(&record.value);
-                                let mut clusters = self.clusters.write().await;
-                                clusters.insert(value.to_string(), ClusterState {
-                                    name: value.to_string(),
-                                    nodes: HashMap::new(),
-                                    last_updated: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                                });
-                            }
-                            GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates: _ } => {
-                                // No record found, nothing to do
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    async fn update_node_status(&self, cluster_name: &str, peer_id: PeerId, status: NodeStatus) -> Result<()> {
-        let mut clusters = self.clusters.write().await;
-        if let Some(state) = clusters.get_mut(cluster_name) {
-            if let Some(node) = state.nodes.get_mut(&peer_id) {
-                node.status = status;
-                node.last_seen = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            }
-        }
-        Ok(())
-    }
-
-    async fn run_network_loop(mut self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Periodically check node status
-                    let clusters = self.clusters.read().await;
-                    for (name, cluster) in clusters.iter() {
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                        for (peer_id, node) in cluster.nodes.iter() {
-                            if now - node.last_seen > NODE_TIMEOUT_SECS {
-                                let mut clusters = self.clusters.write().await;
-                                if let Some(cluster) = clusters.get_mut(name) {
-                                    cluster.nodes.remove(peer_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                event = Arc::get_mut(&mut self).unwrap().swarm.select_next_some() => {
-                    match event {
-                        SwarmEvent::Behaviour(event) => {
-                            self.handle_swarm_event(event).await?;
-                        }
-                        _ => {}
-                    }
-                }
+            Err(_e) => {
+                reply.error(libc::ENOENT);
             }
         }
     }
+
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let entries = vec![
+            (1, FileType::Directory, "."),
+            (1, FileType::Directory, ".."),
+        ];
+
+        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+                break;
+            }
+        }
+        reply.ok();
+    }
 }
 
-unsafe impl Send for P2PNode {}
-unsafe impl Sync for P2PNode {}
-
-fn ui(frame: &mut Frame, app_state: &AppState, creating_cluster: &bool, cluster_name_input: &str, sharing_cluster: &bool) {
-    if *creating_cluster {
-        draw_create_cluster_ui(frame, cluster_name_input);
-    } else if *sharing_cluster {
-        draw_share_cluster_ui(frame, app_state);
-    } else {
-        draw_ui(frame, app_state);
+async fn handle_stream<S>(mut stream: S) -> Result<()> 
+where 
+    S: AsyncRead + AsyncWrite + AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    let mut buf = vec![0u8; 1024];
+    let request_bytes = b"request data";
+    
+    stream.write_all(request_bytes).await?;
+    let n = stream.read(&mut buf).await?;
+    
+    if n > 0 {
+        // Process buf[..n]
     }
+    
+    Ok(())
+}
+
+async fn handle_connection(addr: Multiaddr, transport: Boxed<(PeerId, StreamMuxerBox)>, peer_id: PeerId) -> Result<()> {
+    let fut = transport.dial(addr, libp2p::core::transport::DialOpts::with_peer_id(peer_id))?;
+    
+    match fut.await {
+        Ok((peer_id, mut connection)) => {
+            if let Ok(mut substream) = connection.open_outbound() {
+                handle_stream(substream).await?;
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to dial: {}", e);
+        }
+    }
+    
+    Ok(())
 }

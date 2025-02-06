@@ -24,13 +24,15 @@ tokio = { version = "1.36", features = ["full"] }
 futures = "0.3"
 base64 = "0.21"
 async-trait = "0.1"
+dirs = "5.0"
 #anyhow = "1.0.86"
 #bytes = "1.7.1"
-#clap = { version = "4.5.13", features = ["derive"] }
-#env_logger = "0.11.5"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.10"
 #futures-lite = "2.3.0"
 #iroh = "0.23.0"
-#log = "0.4.22"
+log = "0.4"
 #serde = "1.0.205"
 #serde_json = "1.0.122"
 #tokio = "1.39.2"
+toml = "0.8"
