@@ -330,12 +330,19 @@ impl AppState {
         Ok(())
     }
 
-    fn handle_swarm_event(&mut self, event: SwarmEvent<LisNetworkBehaviourEvent>) {
+    async fn handle_swarm_event(&mut self, event: SwarmEvent<LisNetworkBehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 self.network_status = Some(format!("Listening on {}", address));
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                println!("Connected to peer: {}", peer_id);
+                // Store the peer's address in our routing table
+                if let Some(swarm) = &self.swarm {
+                    let mut swarm = swarm.lock().await;
+                    let addr = endpoint.get_remote_address();
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.to_owned());
+                }
                 self.network_status = Some(format!("Connected to {}", peer_id));
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -635,6 +642,35 @@ impl AppState {
         // Add this cluster to our list
         self.load_clusters()?;
 
+        // Store the ticket data in a file for persistence
+        let peers_file = clusters_dir.join(cluster).join("known_peers.toml");
+        let mut known_peers = if peers_file.exists() {
+            toml::from_str(&fs::read_to_string(&peers_file)?).unwrap_or_default()
+        } else {
+            toml::Table::new()
+        };
+        
+        // Add the host peer to known peers
+        let mut peer_info = toml::Table::new();
+        peer_info.insert("peer_id".into(), toml::Value::String(host_peer_id.to_string()));
+        peer_info.insert("last_seen".into(), toml::Value::Integer(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64));
+        known_peers.insert(host_peer_id.to_string(), toml::Value::Table(peer_info));
+        
+        fs::write(&peers_file, toml::to_string(&known_peers)?)?;
+        
+        // Load known peers into the DHT
+        if let Some(swarm) = &self.swarm {
+            let mut swarm = swarm.lock().await;
+            for (peer_id_str, _) in known_peers {
+                if let Ok(peer_id) = PeerId::from_str(&peer_id_str) {
+                    // Add with default port - they'll update with correct port when we connect
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?);
+                    // Try to connect
+                    let _ = swarm.dial(peer_id);
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -928,7 +964,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_state: &mut AppStat
             if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
                 // Drop the swarm lock before handling the event
                 drop(swarm);
-                app_state.handle_swarm_event(event);
+                app_state.handle_swarm_event(event).await;
             }
         }
     }
@@ -1199,6 +1235,8 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                     println!("Connected Peers: {}", peers.len());
                     for peer in peers.iter() {
                         println!("  - {}", peer);
+                        // Try to maintain connection by refreshing the routing table entry
+                        swarm.behaviour_mut().kademlia.get_closest_peers(*peer);
                     }
                     println!("Active Clusters:");
                     for cluster in &clusters {
@@ -1251,8 +1289,14 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 println!("Listening on {}", address);
                             }
-                            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 println!("Connected to peer: {}", peer_id);
+                                // Store the peer's address in our routing table
+                                if let Some(swarm) = &app_state.swarm {
+                                    let mut swarm = swarm.lock().await;
+                                    let addr = endpoint.get_remote_address();
+                                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.to_owned());
+                                }
                                 let mut peers = connected_peers.lock().await;
                                 peers.insert(peer_id);
                                 // When a peer connects, check if they have a valid ticket
