@@ -370,45 +370,33 @@ impl AppState {
 
     async fn join_cluster(&mut self, cluster: &str, ticket: &str) -> Result<()> {
         let clusters_dir = self.config_path.parent().unwrap().join("clusters");
-        let source_cluster_path = clusters_dir.join(cluster);
         
-        if !source_cluster_path.exists() {
-            return Err(eyre!("Cluster '{}' not found", cluster));
-        }
-
-        // Verify the ticket
-        let tickets_file = source_cluster_path.join("tickets.toml");
-        if !tickets_file.exists() {
-            return Err(eyre!("No valid tickets found for cluster '{}'", cluster));
-        }
-
-        let tickets_content = fs::read_to_string(&tickets_file)?;
-        let tickets: toml::Table = toml::from_str(&tickets_content)?;
-
-        let ticket_info = tickets.get(ticket)
-            .ok_or_else(|| eyre!("Invalid ticket"))?
-            .as_table()
-            .ok_or_else(|| eyre!("Invalid ticket format"))?;
-
-        let peer_id_str = ticket_info.get("peer_id")
-            .ok_or_else(|| eyre!("Invalid ticket: missing peer ID"))?
-            .as_str()
-            .ok_or_else(|| eyre!("Invalid ticket: peer ID format"))?;
-
-        let host_peer_id: PeerId = peer_id_str.parse()?;
-
-        // Create local cluster directory
+        // Create local cluster directory first
         let local_cluster_path = clusters_dir.join(cluster);
         fs::create_dir_all(&local_cluster_path)?;
 
-        // Copy cluster configuration
-        let config_file = source_cluster_path.join("config.toml");
-        if config_file.exists() {
-            fs::copy(&config_file, local_cluster_path.join("config.toml"))?;
-        }
+        // Create initial cluster config
+        let config_path = local_cluster_path.join("config.toml");
+        fs::write(&config_path, format!("name = \"{}\"\nreplication = 2\n", cluster))?;
+
+        // Store the ticket for verification
+        let tickets_file = local_cluster_path.join("tickets.toml");
+        let mut tickets = toml::Table::new();
+        let mut ticket_info = toml::Table::new();
+        ticket_info.insert("ticket".into(), toml::Value::String(ticket.to_string()));
+        tickets.insert("join_ticket".into(), toml::Value::Table(ticket_info));
+        fs::write(&tickets_file, toml::to_string(&tickets)?)?;
 
         // Start listening and attempt to connect via DHT
         self.start_listening().await?;
+
+        // Extract peer ID from ticket (format: cluster:peer_id:timestamp)
+        let ticket_parts: Vec<&str> = ticket.split(':').collect();
+        if ticket_parts.len() != 3 {
+            return Err(eyre!("Invalid ticket format"));
+        }
+        let host_peer_id_str = ticket_parts[1];
+        let host_peer_id: PeerId = host_peer_id_str.parse()?;
 
         if let Some(swarm) = &self.swarm {
             let mut swarm = swarm.lock().await;
@@ -420,6 +408,7 @@ impl AppState {
             }
             
             // Find the host peer through DHT
+            println!("Searching for cluster host with peer ID: {}", host_peer_id);
             swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
         }
 
@@ -434,12 +423,18 @@ impl AppState {
                             println!("Successfully connected to cluster host!");
                             break;
                         }
+                        SwarmEvent::Behaviour(behaviour_event) => {
+                            println!("DHT event: {:?}", behaviour_event);
+                        }
                         _ => {}
                     }
                 }
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             attempts += 1;
+            if attempts % 5 == 0 {
+                println!("Still trying to connect... ({}/30)", attempts);
+            }
         }
 
         if attempts >= 30 {
