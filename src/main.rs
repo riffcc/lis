@@ -59,6 +59,7 @@ use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use std::future::Future;
 use std::pin::Pin;
 use futures::StreamExt;
+use base64;
 
 const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
 const ROOT_DOC_KEY: &str = "root";
@@ -341,15 +342,13 @@ impl AppState {
             return Err(eyre!("Cluster '{}' not found", cluster));
         }
 
-        // Generate a unique ticket using the peer ID and cluster name
+        // Create the ticket data
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_secs();
         
         let ticket_data = format!("{}:{}:{}", cluster, self.peer_id.unwrap(), timestamp);
-        let ticket_hash = blake3::hash(ticket_data.as_bytes());
-        let ticket = hex::encode(&ticket_hash.as_bytes()[..16]); // Use first 16 bytes for a shorter ticket
-
+        
         // Store the ticket in the cluster's tickets file
         let tickets_file = cluster_path.join("tickets.toml");
         let tickets_content = if tickets_file.exists() {
@@ -362,10 +361,14 @@ impl AppState {
         let mut ticket_info = toml::Table::new();
         ticket_info.insert("peer_id".into(), toml::Value::String(self.peer_id.unwrap().to_string()));
         ticket_info.insert("timestamp".into(), toml::Value::Integer(timestamp as i64));
-        tickets.insert(ticket.clone(), toml::Value::Table(ticket_info));
+        ticket_info.insert("data".into(), toml::Value::String(ticket_data.clone()));
+        
+        // Use base64 to make it more compact and avoid any special characters
+        let encoded_ticket = base64::encode(ticket_data);
+        tickets.insert(encoded_ticket.clone(), toml::Value::Table(ticket_info));
 
         fs::write(tickets_file, toml::to_string(&tickets)?)?;
-        Ok(ticket)
+        Ok(encoded_ticket)
     }
 
     async fn join_cluster(&mut self, cluster: &str, ticket: &str) -> Result<()> {
@@ -390,13 +393,24 @@ impl AppState {
         // Start listening and attempt to connect via DHT
         self.start_listening().await?;
 
-        // Extract peer ID from ticket (format: cluster:peer_id:timestamp)
-        let ticket_parts: Vec<&str> = ticket.split(':').collect();
+        // Decode and parse the ticket
+        let ticket_data = String::from_utf8(base64::decode(ticket)
+            .map_err(|_| eyre!("Invalid ticket encoding"))?)?;
+
+        let ticket_parts: Vec<&str> = ticket_data.split(':').collect();
         if ticket_parts.len() != 3 {
             return Err(eyre!("Invalid ticket format"));
         }
-        let host_peer_id_str = ticket_parts[1];
-        let host_peer_id: PeerId = host_peer_id_str.parse()?;
+
+        let ticket_cluster = ticket_parts[0];
+        if ticket_cluster != cluster {
+            return Err(eyre!("Ticket is for cluster '{}', not '{}'", ticket_cluster, cluster));
+        }
+
+        let host_peer_id: PeerId = ticket_parts[1].parse()
+            .map_err(|_| eyre!("Invalid peer ID in ticket"))?;
+
+        println!("Attempting to connect to host peer: {}", host_peer_id);
 
         if let Some(swarm) = &self.swarm {
             let mut swarm = swarm.lock().await;
