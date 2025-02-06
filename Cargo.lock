@@ -2156,6 +2156,7 @@ dependencies = [
  "fuser",
  "futures",
  "hex",
+ "if-addrs",
  "libc",
  "libp2p",
  "log",

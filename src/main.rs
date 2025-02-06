@@ -62,6 +62,7 @@ use std::pin::Pin;
 use futures::StreamExt;
 use base64;
 use base64::Engine;
+use if_addrs;
 
 const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
 const ROOT_DOC_KEY: &str = "root";
@@ -264,7 +265,10 @@ impl AppState {
                     }
                 }) {
                     println!("Adding bootstrap node: {} ({})", addr, peer_id);
-                    kad.add_address(&peer_id, addr.clone());
+                    // Add the address without the peer ID component for dialing
+                    let mut dial_addr = addr.clone();
+                    dial_addr.pop(); // Remove the /p2p/... component
+                    kad.add_address(&peer_id, dial_addr);
                 }
             }
         }
@@ -294,30 +298,42 @@ impl AppState {
     async fn start_listening(&mut self) -> Result<()> {
         if let Some(swarm) = &self.swarm {
             let mut swarm = swarm.lock().await;
-            let mut port = DEFAULT_PORT;
-            let max_attempts = 10; // Try up to 10 ports
+            
+            // Try to listen on all non-loopback interfaces
+            let interfaces = if_addrs::get_if_addrs()?;
             let mut success = false;
-
-            for _ in 0..max_attempts {
-                match swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", port).parse()?) {
-                    Ok(_) => {
-                        println!("Listening on port {}", port);
-                        success = true;
-                        break;
-                    }
-                    Err(e) => {
-                        println!("Failed to listen on port {}: {}", port, e);
-                        port += 1;
+            
+            for iface in interfaces {
+                // Skip loopback interfaces unless it's the only one we have
+                if !iface.is_loopback() {
+                    let ip = iface.ip();
+                    // Only handle IPv4 addresses for now
+                    if let std::net::IpAddr::V4(ipv4) = ip {
+                        let addr = format!("/ip4/{}/tcp/{}", ipv4, DEFAULT_PORT);
+                        match swarm.listen_on(addr.parse()?) {
+                            Ok(_) => {
+                                println!("Listening on {}", addr);
+                                success = true;
+                            }
+                            Err(e) => {
+                                println!("Failed to listen on {}: {}", addr, e);
+                                // Try a random port on this interface
+                                let random_addr = format!("/ip4/{}/tcp/0", ipv4);
+                                if let Ok(_) = swarm.listen_on(random_addr.parse()?) {
+                                    println!("Listening on {} (random port)", ipv4);
+                                    success = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
 
+            // If no other interfaces worked, fall back to loopback
             if !success {
-                return Err(eyre!("Failed to find available port after {} attempts", max_attempts));
+                println!("No external interfaces available, falling back to loopback");
+                swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
             }
-
-            // Also listen on a random port for fallback
-            swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
         }
         Ok(())
     }
@@ -487,7 +503,10 @@ impl AppState {
                             }
                         }) {
                             println!("Adding bootstrap node: {} ({})", addr, peer_id);
-                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                            // Add the address without the peer ID component for dialing
+                            let mut dial_addr = addr.clone();
+                            dial_addr.pop(); // Remove the /p2p/... component
+                            swarm.behaviour_mut().kademlia.add_address(&peer_id, dial_addr);
                         }
                     }
                 }
@@ -1154,20 +1173,45 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
     // Initialize P2P networking
     app_state.init_p2p().await?;
     
-    // Start listening on all interfaces
+    // Start listening on interfaces
     if let Some(swarm) = &app_state.swarm {
         let mut swarm = swarm.lock().await;
-        // Listen on all interfaces
-        swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?)?;
-        // Also listen on localhost for local testing
-        swarm.listen_on(format!("/ip4/127.0.0.1/tcp/{}", DEFAULT_PORT).parse()?)?;
-        // Add some random ports for better connectivity
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-        swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
         
-        // Start a bootstrap process
-        println!("Starting DHT bootstrap...");
-        swarm.behaviour_mut().kademlia.bootstrap()?;
+        // Try to listen on all non-loopback interfaces
+        let interfaces = if_addrs::get_if_addrs()?;
+        let mut success = false;
+        
+        for iface in interfaces {
+            // Skip loopback interfaces unless it's the only one we have
+            if !iface.is_loopback() {
+                let ip = iface.ip();
+                // Only handle IPv4 addresses for now
+                if let std::net::IpAddr::V4(ipv4) = ip {
+                    let addr = format!("/ip4/{}/tcp/{}", ipv4, DEFAULT_PORT);
+                    match swarm.listen_on(addr.parse()?) {
+                        Ok(_) => {
+                            println!("Listening on {}", addr);
+                            success = true;
+                        }
+                        Err(e) => {
+                            println!("Failed to listen on {}: {}", addr, e);
+                            // Try a random port on this interface
+                            let random_addr = format!("/ip4/{}/tcp/0", ipv4);
+                            if let Ok(_) = swarm.listen_on(random_addr.parse()?) {
+                                println!("Listening on {} (random port)", ipv4);
+                                success = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If no other interfaces worked, fall back to loopback
+        if !success {
+            println!("No external interfaces available, falling back to loopback");
+            swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+        }
     }
     
     app_state.start_listening().await?;
