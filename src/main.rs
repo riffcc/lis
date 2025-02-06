@@ -224,9 +224,21 @@ impl AppState {
     }
 
     async fn init_p2p(&mut self) -> Result<()> {
-        // Create a random PeerId
-        let local_key = identity::Keypair::generate_ed25519();
+        // Load or create a persistent keypair
+        let key_path = self.config_path.parent().unwrap().join("peer_key");
+        let local_key = if key_path.exists() {
+            // Load existing keypair
+            let key_bytes = fs::read(&key_path)?;
+            identity::Keypair::from_protobuf_encoding(&key_bytes)?
+        } else {
+            // Generate and save new keypair
+            let key = identity::Keypair::generate_ed25519();
+            fs::write(&key_path, key.to_protobuf_encoding()?)?;
+            key
+        };
+
         let local_peer_id = PeerId::from(local_key.public());
+        println!("Local peer ID: {}", local_peer_id);
         self.peer_id = Some(local_peer_id);
 
         // Create a transport with noise encryption and yamux multiplexing
