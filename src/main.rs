@@ -242,8 +242,18 @@ impl AppState {
 
         // Add bootstrap nodes
         for node in BOOTSTRAP_NODES.iter() {
-            if let Ok(addr) = node.parse() {
-                kad.add_address(&PeerId::random(), addr);
+            if let Ok(addr) = node.parse::<Multiaddr>() {
+                // Extract the peer ID from the multiaddr
+                if let Some(peer_id) = addr.iter().find_map(|p| {
+                    if let libp2p::multiaddr::Protocol::P2p(hash) = p {
+                        Some(PeerId::from(hash))
+                    } else {
+                        None
+                    }
+                }) {
+                    println!("Adding bootstrap node: {} ({})", addr, peer_id);
+                    kad.add_address(&peer_id, addr.clone());
+                }
             }
         }
 
@@ -426,13 +436,13 @@ impl AppState {
                         // Extract the peer ID from the multiaddr
                         if let Some(peer_id) = addr.iter().find_map(|p| {
                             if let libp2p::multiaddr::Protocol::P2p(hash) = p {
-                                Some(hash)
+                                Some(PeerId::from(hash))
                             } else {
                                 None
                             }
                         }) {
                             println!("Adding bootstrap node: {} ({})", addr, peer_id);
-                            swarm.behaviour_mut().kademlia.add_address(&peer_id.into(), addr.clone());
+                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
                         }
                     }
                 }
