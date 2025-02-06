@@ -563,9 +563,32 @@ impl AppState {
                 println!("Searching for cluster host with peer ID: {}", host_peer_id);
                 swarm.behaviour_mut().kademlia.get_closest_peers(host_peer_id);
                 
-                // Add the host peer ID to our routing table
-                println!("Adding host peer to routing table");
-                swarm.behaviour_mut().kademlia.add_address(&host_peer_id, format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?);
+                // Try all known ports for the host
+                println!("Attempting to connect to host on known ports...");
+                for port in [DEFAULT_PORT, 0] {
+                    // Try IPv4 interfaces
+                    let interfaces = if_addrs::get_if_addrs()?;
+                    for iface in interfaces {
+                        if !iface.is_loopback() {
+                            if let std::net::IpAddr::V4(ipv4) = iface.ip() {
+                                let addr = format!("/ip4/{}/tcp/{}", ipv4, port);
+                                if let Ok(multiaddr) = addr.parse::<Multiaddr>() {
+                                    swarm.behaviour_mut().kademlia.add_address(&host_peer_id, multiaddr.clone());
+                                    println!("Added potential host address: {}", addr);
+                                    let _ = swarm.dial(host_peer_id);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Also try loopback
+                    let addr = format!("/ip4/127.0.0.1/tcp/{}", port);
+                    if let Ok(multiaddr) = addr.parse::<Multiaddr>() {
+                        swarm.behaviour_mut().kademlia.add_address(&host_peer_id, multiaddr.clone());
+                        println!("Added potential host address: {}", addr);
+                        let _ = swarm.dial(host_peer_id);
+                    }
+                }
             }
 
             // Wait for connection to be established
@@ -576,7 +599,7 @@ impl AppState {
                     let mut swarm = swarm.lock().await;
                     if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
                         match event {
-                            SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_peer_id => {
+                            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } if peer_id == host_peer_id => {
                                 println!("Successfully connected to cluster host!");
                                 connected = true;
                                 break;
@@ -672,7 +695,7 @@ impl AppState {
         // Add the host peer to known peers
         let mut peer_info = toml::Table::new();
         peer_info.insert("peer_id".into(), toml::Value::String(host_peer_id.to_string()));
-        peer_info.insert("last_seen".into(), toml::Value::Integer(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64));
+        peer_info.insert("timestamp".into(), toml::Value::Integer(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64));
         known_peers.insert(host_peer_id.to_string(), toml::Value::Table(peer_info));
         
         fs::write(&peers_file, toml::to_string(&known_peers)?)?;
@@ -1339,7 +1362,29 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                 if let Some(swarm) = &app_state.swarm {
                                     let mut swarm = swarm.lock().await;
                                     let addr = endpoint.get_remote_address();
+                                    // Store the actual working address we connected on
                                     swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.to_owned());
+                                    
+                                    // Check each cluster for this peer
+                                    for cluster in &app_state.clusters {
+                                        let peers_file = clusters_dir.join(cluster).join("known_peers.toml");
+                                        if peers_file.exists() {
+                                            if let Ok(mut known_peers) = toml::from_str::<toml::Table>(&fs::read_to_string(&peers_file)?) {
+                                                if let Some(peer_info) = known_peers.get_mut(&peer_id.to_string()) {
+                                                    if let Some(info_table) = peer_info.as_table_mut() {
+                                                        info_table.insert("last_working_addr".into(), toml::Value::String(addr.to_string()));
+                                                        info_table.insert("last_seen".into(), toml::Value::Integer(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64));
+                                                        fs::write(&peers_file, toml::to_string(&known_peers)?)?;
+                                                        println!("Updated working address for peer: {}", addr);
+                                                        
+                                                        // Start providing the cluster topic again to maintain visibility
+                                                        let topic = format!("lis-cluster:{}", cluster);
+                                                        let _ = swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 let mut peers = connected_peers.lock().await;
                                 peers.insert(peer_id);
@@ -1353,12 +1398,6 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                     // Add peer to cluster's peer set
                                                     if let Some(peers) = cluster_peers.get_mut(cluster) {
                                                         peers.insert(peer_id);
-                                                    }
-                                                    // Start providing the cluster topic
-                                                    if let Some(swarm) = &app_state.swarm {
-                                                        let mut swarm = swarm.lock().await;
-                                                        let topic = format!("lis-cluster:{}", cluster);
-                                                        let _ = swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
                                                     }
                                                 }
                                             }
