@@ -71,6 +71,7 @@ const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents"
 const ROOT_DOC_KEY: &str = "root";
 const NODE_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_PORT: u16 = 34163;
+const RELAY_TOPIC: &str = "/lis/relay/v1";
 const BOOTSTRAP_NODES: [&str; 5] = [
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
@@ -260,7 +261,13 @@ impl AppState {
         // Create behaviours
         let store = MemoryStore::new(local_peer_id);
         let mut kad = Kademlia::new(local_peer_id, store);
-        let relay = libp2p_relay::Behaviour::new(local_peer_id, libp2p_relay::Config::default());
+        let relay = {
+            let mut config = libp2p_relay::Config::default();
+            config.max_circuits = 100;
+            config.max_reservations = 100;
+            config.reservation_duration = Duration::from_secs(3600); // 1 hour
+            libp2p_relay::Behaviour::new(local_peer_id, config)
+        };
         let dcutr = libp2p_dcutr::Behaviour::new(local_peer_id);
         let identify = identify::Behaviour::new(identify::Config::new(
             "lis/1.0".to_string(),
