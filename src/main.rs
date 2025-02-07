@@ -41,6 +41,9 @@ use libp2p::{
     PeerId,
     SwarmBuilder,
     Transport,
+    relay,
+    dcutr,
+    identify,
 };
 use nix::mount::{self, MntFlags};
 use ratatui::{
@@ -247,16 +250,22 @@ impl AppState {
         println!("Local peer ID: {}", local_peer_id);
         self.peer_id = Some(local_peer_id);
 
-        // Create a transport with noise encryption and yamux multiplexing
+        // Create a transport with noise encryption, yamux multiplexing
         let transport = tcp::tokio::Transport::new(tcp::Config::default())
             .upgrade(upgrade::Version::V1)
             .authenticate(noise::Config::new(&local_key)?)
             .multiplex(yamux::Config::default())
             .boxed();
 
-        // Create a Kademlia behaviour with memory store
+        // Create behaviours
         let store = MemoryStore::new(local_peer_id);
         let mut kad = Kademlia::new(local_peer_id, store);
+        let relay = libp2p_relay::Behaviour::new(local_peer_id, libp2p_relay::Config::default());
+        let dcutr = libp2p_dcutr::Behaviour::new(local_peer_id);
+        let identify = identify::Behaviour::new(identify::Config::new(
+            "lis/1.0".to_string(),
+            local_key.public(),
+        ));
         
         // Add bootstrap nodes
         let mut bootstrap_addresses = Vec::new();
@@ -290,18 +299,21 @@ impl AppState {
 
         let behaviour = LisNetworkBehaviour {
             kademlia: kad,
+            relay,
+            dcutr,
+            identify,
         };
 
-        // Create a Swarm with noise encryption and yamux multiplexing
+        // Create a Swarm
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
             .with_behaviour(|_| behaviour)?
             .build();
 
-        // Listen on the default port
+        // Listen on all interfaces
         swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?)?;
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?; // Also listen on a random port for fallback
+        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?; // Fallback port
 
         // Try to connect to bootstrap nodes directly
         for (peer_id, addr) in bootstrap_addresses {
@@ -312,7 +324,7 @@ impl AppState {
         }
 
         self.swarm = Some(Arc::new(Mutex::new(swarm)));
-
+        
         // Connect to bootstrap nodes with retries
         self.connect_to_bootstrap_nodes().await?;
         
@@ -418,6 +430,23 @@ impl AppState {
                     if is_bootstrap { "bootstrap peer " } else { "" },
                     peer_id
                 ));
+            }
+            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Identify(identify::Event::Received { peer_id, ref info, connection_id: _ })) => {
+                println!("Identified peer {} running {}", peer_id, info.protocol_version);
+                if let Some(addr) = info.listen_addrs.first() {
+                    println!("Peer {} is listening on {}", peer_id, addr);
+                    // Add the address to Kademlia
+                    if let Some(swarm) = &self.swarm {
+                        let mut swarm = swarm.lock().await;
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Relay(ref e)) => {
+                println!("Relay event: {:?}", e);
+            }
+            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Dcutr(ref e)) => {
+                println!("Hole punching event: {:?}", e);
             }
             _ => {}
         }
@@ -1221,8 +1250,45 @@ fn draw_ui(frame: &mut Frame, app_state: &AppState) {
 
 /// Network behavior for the Lis application
 #[derive(NetworkBehaviour)]
+#[behaviour(to_swarm = "LisNetworkBehaviourEvent")]
+#[behaviour(event_process = false)]
 struct LisNetworkBehaviour {
     kademlia: Kademlia<MemoryStore>,
+    relay: libp2p_relay::Behaviour,
+    dcutr: libp2p_dcutr::Behaviour,
+    identify: identify::Behaviour,
+}
+
+#[derive(Debug)]
+enum LisNetworkBehaviourEvent {
+    Kademlia(libp2p::kad::Event),
+    Relay(libp2p_relay::Event),
+    Dcutr(libp2p_dcutr::Event),
+    Identify(identify::Event),
+}
+
+impl From<libp2p::kad::Event> for LisNetworkBehaviourEvent {
+    fn from(event: libp2p::kad::Event) -> Self {
+        LisNetworkBehaviourEvent::Kademlia(event)
+    }
+}
+
+impl From<libp2p_relay::Event> for LisNetworkBehaviourEvent {
+    fn from(event: libp2p_relay::Event) -> Self {
+        LisNetworkBehaviourEvent::Relay(event)
+    }
+}
+
+impl From<libp2p_dcutr::Event> for LisNetworkBehaviourEvent {
+    fn from(event: libp2p_dcutr::Event) -> Self {
+        LisNetworkBehaviourEvent::Dcutr(event)
+    }
+}
+
+impl From<identify::Event> for LisNetworkBehaviourEvent {
+    fn from(event: identify::Event) -> Self {
+        LisNetworkBehaviourEvent::Identify(event)
+    }
 }
 
 /// Cluster state
@@ -1526,6 +1592,23 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                         }
                                         _ => {}
                                     }
+                                }
+                                SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Identify(identify::Event::Received { peer_id, ref info, connection_id: _ })) => {
+                                    println!("Identified peer {} running {}", peer_id, info.protocol_version);
+                                    if let Some(addr) = info.listen_addrs.first() {
+                                        println!("Peer {} is listening on {}", peer_id, addr);
+                                        // Add the address to Kademlia
+                                        if let Some(swarm) = &app_state.swarm {
+                                            let mut swarm = swarm.lock().await;
+                                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                        }
+                                    }
+                                }
+                                SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Relay(ref e)) => {
+                                    println!("Relay event: {:?}", e);
+                                }
+                                SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Dcutr(ref e)) => {
+                                    println!("Hole punching event: {:?}", e);
                                 }
                                 _ => {}
                             }
