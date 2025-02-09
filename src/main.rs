@@ -3,30 +3,24 @@ use std::{
     env,
     ffi::OsStr,
     fs,
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
     task::{Context, Poll},
-    str::FromStr,
 };
 
-use clap::Parser;
-use color_eyre::{eyre::Context as EyreContext, Result, eyre::eyre};
+use color_eyre::{Result, eyre::eyre};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dirs;
-use env_logger;
-use fuser::{FileAttr, FileType, Filesystem, MountOption, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry};
+use fuser::{FileAttr, FileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry};
 use libp2p::{
     core::{
         muxing::{StreamMuxerBox, StreamMuxerExt},
         transport::Boxed,
-        upgrade,
-        StreamMuxer,
     },
     identity,
     kad::{
@@ -40,15 +34,13 @@ use libp2p::{
     Multiaddr,
     PeerId,
     SwarmBuilder,
-    Transport,
-    relay,
-    dcutr,
     identify,
+    Transport,
 };
 use nix::mount::{self, MntFlags};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
@@ -56,13 +48,11 @@ use ratatui::{
 };
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use toml;
 use uuid::Uuid;
-use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use std::future::Future;
+use futures::{AsyncReadExt, AsyncWriteExt};
 use std::pin::Pin;
-use futures::StreamExt;
 use base64;
 use base64::Engine;
 use if_addrs;
@@ -251,13 +241,6 @@ impl AppState {
         println!("Local peer ID: {}", local_peer_id);
         self.peer_id = Some(local_peer_id);
 
-        // Create a transport with noise encryption, yamux multiplexing
-        let transport = tcp::tokio::Transport::new(tcp::Config::default())
-            .upgrade(upgrade::Version::V1)
-            .authenticate(noise::Config::new(&local_key)?)
-            .multiplex(yamux::Config::default())
-            .boxed();
-
         // Create behaviours
         let store = MemoryStore::new(local_peer_id);
         let mut kad = Kademlia::new(local_peer_id, store);
@@ -265,6 +248,7 @@ impl AppState {
             let mut config = libp2p_relay::Config::default();
             config.max_circuits = 100;
             config.max_reservations = 100;
+            config.max_reservations_per_peer = 10;
             config.reservation_duration = Duration::from_secs(3600); // 1 hour
             libp2p_relay::Behaviour::new(local_peer_id, config)
         };
@@ -274,35 +258,40 @@ impl AppState {
             local_key.public(),
         ));
         
-        // Add bootstrap nodes
+        // Enable server mode and set up Kademlia
+        kad.set_mode(Some(libp2p::kad::Mode::Server));
+        
+        // Add bootstrap nodes with better error handling
         let mut bootstrap_addresses = Vec::new();
         let mut bootstrap_peer_ids = HashSet::new();
         for node in BOOTSTRAP_NODES.iter() {
-            if let Ok(addr) = node.parse::<Multiaddr>() {
-                // Extract the peer ID from the multiaddr
-                if let Some(peer_id) = addr.iter().find_map(|p| {
-                    if let libp2p::multiaddr::Protocol::P2p(hash) = p {
-                        Some(PeerId::from(hash))
-                    } else {
-                        None
+            match node.parse::<Multiaddr>() {
+                Ok(addr) => {
+                    if let Some(peer_id) = addr.iter().find_map(|p| {
+                        if let libp2p::multiaddr::Protocol::P2p(hash) = p {
+                            Some(PeerId::from(hash))
+                        } else {
+                            None
+                        }
+                    }) {
+                        println!("Adding bootstrap node: {} ({})", addr, peer_id);
+                        bootstrap_peer_ids.insert(peer_id);
+                        // Add the address without the peer ID component for dialing
+                        let mut dial_addr = addr.clone();
+                        dial_addr.pop(); // Remove the /p2p/... component
+                        kad.add_address(&peer_id, dial_addr.clone());
+                        bootstrap_addresses.push((peer_id, addr.clone()));
                     }
-                }) {
-                    println!("Adding bootstrap node: {} ({})", addr, peer_id);
-                    bootstrap_peer_ids.insert(peer_id);
-                    // Add the address without the peer ID component for dialing
-                    let mut dial_addr = addr.clone();
-                    dial_addr.pop(); // Remove the /p2p/... component
-                    kad.add_address(&peer_id, dial_addr.clone());
-                    bootstrap_addresses.push((peer_id, addr.clone()));
+                }
+                Err(e) => {
+                    println!("Failed to parse bootstrap node address {}: {}", node, e);
+                    continue;
                 }
             }
         }
 
         // Store bootstrap peers in the struct for tracking
         self.bootstrap_peers = Some(bootstrap_peer_ids);
-
-        // Enable server mode
-        kad.set_mode(Some(libp2p::kad::Mode::Server));
 
         let behaviour = LisNetworkBehaviour {
             kademlia: kad,
@@ -311,20 +300,44 @@ impl AppState {
             identify,
         };
 
-        // Create a Swarm
-        let mut swarm = SwarmBuilder::with_existing_identity(local_key)
-            .with_tokio()
-            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
-            .with_behaviour(|_| behaviour)?
-            .build();
+        // Create a Swarm with more aggressive timeouts
+        let mut swarm = {
+            // Create the transport
+            let transport = libp2p::tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
+                .upgrade(libp2p::core::upgrade::Version::V1)
+                .authenticate(noise::Config::new(&local_key).expect("signing libp2p-noise static keypair"))
+                .multiplex(yamux::Config::default())
+                .boxed();
+
+            // Build the swarm
+            SwarmBuilder::with_existing_identity(local_key.clone())
+                .with_tokio()
+                .with_tcp(
+                    tcp::Config::default(),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
+                .with_behaviour(|_| behaviour)?
+                .with_swarm_config(|cfg| cfg)
+                .build()
+        };
 
         // Listen on all interfaces
-        swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?)?;
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?; // Fallback port
+        println!("Attempting to listen on port {}", DEFAULT_PORT);
+        match swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", DEFAULT_PORT).parse()?) {
+            Ok(_) => println!("Successfully listening on port {}", DEFAULT_PORT),
+            Err(e) => println!("Failed to listen on port {}: {}", DEFAULT_PORT, e),
+        }
+        
+        // Also listen on a random port as fallback
+        match swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?) {
+            Ok(_) => println!("Successfully listening on random port"),
+            Err(e) => println!("Failed to listen on random port: {}", e),
+        }
 
         // Try to connect to bootstrap nodes directly
         for (peer_id, addr) in bootstrap_addresses {
-            println!("Attempting to connect to bootstrap node: {}", addr);
+            println!("Attempting to connect to bootstrap node: {} ({})", addr, peer_id);
             if let Err(e) = swarm.dial(addr.clone()) {
                 println!("Failed to dial bootstrap node {}: {}", addr, e);
             }
@@ -396,9 +409,10 @@ impl AppState {
         Ok(())
     }
 
-    async fn handle_swarm_event(&mut self, event: SwarmEvent<LisNetworkBehaviourEvent>) {
+    async fn handle_swarm_event(&mut self, event: SwarmEvent<LisNetworkBehaviourEvent>) -> Result<()> {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
+                println!("📡 Listening on {}", address);
                 self.network_status = Some(format!("Listening on {}", address));
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
@@ -407,9 +421,9 @@ impl AppState {
                     .unwrap_or(false);
                 
                 if is_bootstrap {
-                    println!("Connected to bootstrap peer: {} at {}", peer_id, endpoint.get_remote_address());
+                    println!("🌟 Connected to bootstrap peer: {} at {}", peer_id, endpoint.get_remote_address());
                 } else {
-                    println!("Connected to peer: {}", peer_id);
+                    println!("✅ Connected to peer: {} at {}", peer_id, endpoint.get_remote_address());
                 }
 
                 // Store the peer's address in our routing table
@@ -417,31 +431,39 @@ impl AppState {
                     let mut swarm = swarm.lock().await;
                     let addr = endpoint.get_remote_address();
                     swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.to_owned());
+                    
+                    // Start a bootstrap process when we connect to a bootstrap node
+                    if is_bootstrap {
+                        println!("Starting DHT bootstrap after connecting to bootstrap peer...");
+                        if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+                            println!("Failed to start bootstrap: {}", e);
+                        }
+                    }
                 }
                 self.network_status = Some(format!("Connected to {}{}", 
                     if is_bootstrap { "bootstrap peer " } else { "" },
                     peer_id
                 ));
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 let is_bootstrap = self.bootstrap_peers.as_ref()
                     .map(|peers| peers.contains(&peer_id))
                     .unwrap_or(false);
                 
                 if is_bootstrap {
-                    println!("Disconnected from bootstrap peer: {}", peer_id);
+                    println!("❌ Disconnected from bootstrap peer: {} (cause: {:?})", peer_id, cause);
                 } else {
-                    println!("Disconnected from peer: {}", peer_id);
+                    println!("❌ Disconnected from peer: {} (cause: {:?})", peer_id, cause);
                 }
                 self.network_status = Some(format!("Disconnected from {}{}", 
                     if is_bootstrap { "bootstrap peer " } else { "" },
                     peer_id
                 ));
             }
-            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Identify(identify::Event::Received { peer_id, ref info, connection_id: _ })) => {
-                println!("Identified peer {} running {}", peer_id, info.protocol_version);
+            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Identify(identify::Event::Received { peer_id, ref info, .. })) => {
+                println!("🔍 Identified peer {} running {}", peer_id, info.protocol_version);
                 if let Some(addr) = info.listen_addrs.first() {
-                    println!("Peer {} is listening on {}", peer_id, addr);
+                    println!("  📍 Peer {} is listening on {}", peer_id, addr);
                     // Add the address to Kademlia
                     if let Some(swarm) = &self.swarm {
                         let mut swarm = swarm.lock().await;
@@ -449,14 +471,83 @@ impl AppState {
                     }
                 }
             }
-            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Relay(ref e)) => {
-                println!("Relay event: {:?}", e);
+            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Kademlia(ref event)) => {
+                match event {
+                    libp2p::kad::Event::OutboundQueryProgressed { result, stats, .. } => {
+                        match result {
+                            libp2p::kad::QueryResult::Bootstrap(_) => {
+                                println!("🔄 Bootstrap progress: {} peers in {}ms", 
+                                    stats.num_successes(),
+                                    stats.duration().map_or(0, |d| d.as_millis())
+                                );
+                            }
+                            libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                println!("👥 Found {} close peers", ok.peers.len());
+                                if let Some(swarm) = &self.swarm {
+                                    let mut swarm = swarm.lock().await;
+                                    let local_peer_id = *swarm.local_peer_id();
+                                    let connected = swarm.connected_peers().cloned().collect::<Vec<_>>();
+                                    for peer_info in &ok.peers {
+                                        let peer_id = peer_info.peer_id;
+                                        if peer_id != local_peer_id && !connected.contains(&peer_id) {
+                                            println!("Attempting to connect to peer: {}", peer_id);
+                                            let _ = swarm.dial(peer_id);
+                                        }
+                                    }
+                                }
+                            }
+                            libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
+                                match ok {
+                                    libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
+                                        if let Some(swarm) = &self.swarm {
+                                            let mut swarm = swarm.lock().await;
+                                            let local_peer_id = *swarm.local_peer_id();
+                                            let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
+                                            for provider in providers {
+                                                println!("Found provider: {}", provider);
+                                                let provider_id = provider.clone();
+                                                if provider_id != local_peer_id && !connected_peers.contains(&provider) {
+                                                    println!("Attempting to connect to provider: {}", provider);
+                                                    let _ = swarm.dial(provider_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
+                                        println!("No providers found, but got {} closest peers", closest_peers.len());
+                                        if let Some(swarm) = &self.swarm {
+                                            let mut swarm = swarm.lock().await;
+                                            let local_peer_id = *swarm.local_peer_id();
+                                            let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
+                                            for peer in closest_peers {
+                                                let peer_id = peer.clone();
+                                                if peer_id != local_peer_id && !connected_peers.contains(&peer) {
+                                                    println!("Attempting to connect to closest peer: {}", peer);
+                                                    let _ = swarm.dial(peer_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Relay(e)) => {
+                println!("🔄 Relay event: {:?}", e);
             }
             SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Dcutr(ref e)) => {
-                println!("Hole punching event: {:?}", e);
+                println!("🕳️ Hole punching event: {:?}", e);
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                println!("⚠️ Failed to connect to peer {:?}: {}", peer_id, error);
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn load_clusters(&mut self) -> Result<()> {
@@ -559,10 +650,9 @@ impl AppState {
         self.start_listening().await?;
 
         // Decode and parse the ticket
-        let ticket_data = String::from_utf8(
-            base64::engine::general_purpose::STANDARD.decode(ticket)
-                .map_err(|_| eyre!("Invalid ticket encoding"))?
-        )?;
+        let ticket_bytes = base64::engine::general_purpose::STANDARD.decode(ticket)
+            .map_err(|_| eyre!("Invalid ticket encoding"))?;
+        let ticket_data = String::from_utf8(ticket_bytes)?;
 
         let ticket_parts: Vec<&str> = ticket_data.split(':').collect();
         if ticket_parts.len() != 3 {
@@ -706,45 +796,60 @@ impl AppState {
                             }
                             SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Kademlia(ref kad_event)) => {
                                 match kad_event {
-                                    libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
+                                    libp2p::kad::Event::OutboundQueryProgressed { result, stats, .. } => {
                                         match result {
+                                            libp2p::kad::QueryResult::Bootstrap(_) => {
+                                                println!("🔄 Bootstrap progress: {} peers in {}ms", 
+                                                    stats.num_successes(),
+                                                    stats.duration().map_or(0, |d| d.as_millis())
+                                                );
+                                            }
+                                            libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                                println!("👥 Found {} close peers", ok.peers.len());
+                                                if let Some(swarm) = &self.swarm {
+                                                    let mut swarm = swarm.lock().await;
+                                                    let local_peer_id = *swarm.local_peer_id();
+                                                    let connected = swarm.connected_peers().cloned().collect::<Vec<_>>();
+                                                    for peer_info in &ok.peers {
+                                                        let peer_id = peer_info.peer_id;
+                                                        if peer_id != local_peer_id && !connected.contains(&peer_id) {
+                                                            println!("Attempting to connect to peer: {}", peer_id);
+                                                            let _ = swarm.dial(peer_id);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
                                                 match ok {
                                                     libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
-                                                        let local_peer_id = *swarm.local_peer_id();
-                                                        let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
-                                                        for provider in providers {
-                                                            println!("Found provider: {}", provider);
-                                                            let provider_id = provider.clone();
-                                                            if provider_id != local_peer_id && !connected_peers.contains(&provider) {
-                                                                println!("Attempting to connect to provider: {}", provider);
-                                                                let _ = swarm.dial(provider_id);
+                                                        if let Some(swarm) = &self.swarm {
+                                                            let mut swarm = swarm.lock().await;
+                                                            let local_peer_id = *swarm.local_peer_id();
+                                                            let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
+                                                            for provider in providers {
+                                                                println!("Found provider: {}", provider);
+                                                                let provider_id = provider.clone();
+                                                                if provider_id != local_peer_id && !connected_peers.contains(&provider) {
+                                                                    println!("Attempting to connect to provider: {}", provider);
+                                                                    let _ = swarm.dial(provider_id);
+                                                                }
                                                             }
                                                         }
                                                     }
                                                     libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
                                                         println!("No providers found, but got {} closest peers", closest_peers.len());
-                                                        let local_peer_id = *swarm.local_peer_id();
-                                                        let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
-                                                        for peer in closest_peers {
-                                                            let peer_id = peer.clone();
-                                                            if peer_id != local_peer_id && !connected_peers.contains(&peer) {
-                                                                println!("Attempting to connect to closest peer: {}", peer);
-                                                                let _ = swarm.dial(peer_id);
+                                                        if let Some(swarm) = &self.swarm {
+                                                            let mut swarm = swarm.lock().await;
+                                                            let local_peer_id = *swarm.local_peer_id();
+                                                            let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
+                                                            for peer in closest_peers {
+                                                                let peer_id = peer.clone();
+                                                                if peer_id != local_peer_id && !connected_peers.contains(&peer) {
+                                                                    println!("Attempting to connect to closest peer: {}", peer);
+                                                                    let _ = swarm.dial(peer_id);
+                                                                }
                                                             }
                                                         }
-                                                    }
-                                                }
-                                            }
-                                            libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
-                                                println!("Found {} close peers", ok.peers.len());
-                                                let local_peer_id = *swarm.local_peer_id();
-                                                let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
-                                                for peer_info in &ok.peers {
-                                                    let peer_id = peer_info.peer_id;
-                                                    if peer_id != local_peer_id && !connected_peers.contains(&peer_id) {
-                                                        println!("Attempting to connect to peer: {}", peer_id);
-                                                        let _ = swarm.dial(peer_id);
                                                     }
                                                 }
                                             }
@@ -1188,10 +1293,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_state: &mut AppStat
         // Then check for swarm events without blocking
         if let Some(swarm) = &app_state.swarm {
             let mut swarm = swarm.lock().await;
-            if let Poll::Ready(Some(event)) = swarm.poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref())) {
-                // Drop the swarm lock before handling the event
+            if let Poll::Ready(Some(event)) = futures::Stream::poll_next(Pin::new(&mut *swarm), &mut Context::from_waker(futures::task::noop_waker_ref())) {
+                // Drop the lock before handling the event
                 drop(swarm);
-                app_state.handle_swarm_event(event).await;
+                app_state.handle_swarm_event(event).await?;
             }
         }
     }
@@ -1549,14 +1654,46 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                     if let Some(swarm) = &app_state.swarm {
                         let mut swarm = swarm.lock().await;
                         if let Poll::Ready(Some(event)) = futures::Stream::poll_next(Pin::new(&mut *swarm), &mut Context::from_waker(futures::task::noop_waker_ref())) {
-                            match event {
-                                SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Kademlia(ref kad_event)) => {
-                                    match kad_event {
-                                        libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
-                                            match result {
-                                                libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
-                                                    match ok {
-                                                        libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
+                            Some(event)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } => {
+                    if let Some(event) = event {
+                        match event {
+                            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Kademlia(kad_event)) => {
+                                match kad_event {
+                                    libp2p::kad::Event::OutboundQueryProgressed { result, stats, .. } => {
+                                        match result {
+                                            libp2p::kad::QueryResult::Bootstrap(_) => {
+                                                println!("🔄 Bootstrap progress: {} peers in {}ms", 
+                                                    stats.num_successes(),
+                                                    stats.duration().map_or(0, |d| d.as_millis())
+                                                );
+                                            }
+                                            libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                                                println!("👥 Found {} close peers", ok.peers.len());
+                                                if let Some(swarm) = &app_state.swarm {
+                                                    let mut swarm = swarm.lock().await;
+                                                    let local_peer_id = *swarm.local_peer_id();
+                                                    let connected = swarm.connected_peers().cloned().collect::<Vec<_>>();
+                                                    for peer_info in &ok.peers {
+                                                        let peer_id = peer_info.peer_id;
+                                                        if peer_id != local_peer_id && !connected.contains(&peer_id) {
+                                                            println!("Attempting to connect to peer: {}", peer_id);
+                                                            let _ = swarm.dial(peer_id);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            libp2p::kad::QueryResult::GetProviders(Ok(ok)) => {
+                                                match ok {
+                                                    libp2p::kad::GetProvidersOk::FoundProviders { providers, .. } => {
+                                                        if let Some(swarm) = &app_state.swarm {
+                                                            let mut swarm = swarm.lock().await;
                                                             let local_peer_id = *swarm.local_peer_id();
                                                             let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
                                                             for provider in providers {
@@ -1568,8 +1705,11 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                                 }
                                                             }
                                                         }
-                                                        libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
-                                                            println!("No providers found, but got {} closest peers", closest_peers.len());
+                                                    }
+                                                    libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
+                                                        println!("No providers found, but got {} closest peers", closest_peers.len());
+                                                        if let Some(swarm) = &app_state.swarm {
+                                                            let mut swarm = swarm.lock().await;
                                                             let local_peer_id = *swarm.local_peer_id();
                                                             let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
                                                             for peer in closest_peers {
@@ -1582,96 +1722,32 @@ async fn run_daemon(config: Option<String>) -> Result<()> {
                                                         }
                                                     }
                                                 }
-                                                libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
-                                                    println!("Found {} close peers", ok.peers.len());
-                                                    let local_peer_id = *swarm.local_peer_id();
-                                                    let connected_peers = swarm.connected_peers().cloned().collect::<Vec<_>>();
-                                                    for peer_info in &ok.peers {
-                                                        let peer_id = peer_info.peer_id;
-                                                        if peer_id != local_peer_id && !connected_peers.contains(&peer_id) {
-                                                            println!("Attempting to connect to peer: {}", peer_id);
-                                                            let _ = swarm.dial(peer_id);
-                                                        }
-                                                    }
-                                                }
-                                                _ => {}
                                             }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Identify(identify::Event::Received { peer_id, ref info, connection_id: _ })) => {
-                                    println!("Identified peer {} running {}", peer_id, info.protocol_version);
-                                    if let Some(addr) = info.listen_addrs.first() {
-                                        println!("Peer {} is listening on {}", peer_id, addr);
-                                        // Add the address to Kademlia
-                                        if let Some(swarm) = &app_state.swarm {
-                                            let mut swarm = swarm.lock().await;
-                                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                            _ => {}
                                         }
                                     }
+                                    _ => {}
                                 }
-                                SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Relay(ref e)) => {
-                                    println!("Relay event: {:?}", e);
-                                }
-                                SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Dcutr(ref e)) => {
-                                    println!("Hole punching event: {:?}", e);
-                                }
-                                _ => {}
                             }
-                            Some(event)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } => {
-                    if let Some(event) = event {
-                        match event {
-                            SwarmEvent::NewListenAddr { address, .. } => {
-                                println!("Listening on {}", address);
+                            SwarmEvent::Behaviour(LisNetworkBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                                println!("🔍 Identified peer {} running {}", peer_id, info.protocol_version);
+                                if let Some(addr) = info.listen_addrs.first() {
+                                    println!("  📍 Peer {} is listening on {}", peer_id, addr);
+                                    if let Some(swarm) = &app_state.swarm {
+                                        let mut swarm = swarm.lock().await;
+                                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                    }
+                                }
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                                println!("Connected to peer: {}", peer_id);
-                                // Store the peer's address in our routing table
+                                println!("🌟 Connected to peer: {} at {}", peer_id, endpoint.get_remote_address());
                                 if let Some(swarm) = &app_state.swarm {
                                     let mut swarm = swarm.lock().await;
-                                    let addr = endpoint.get_remote_address();
-                                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.to_owned());
-                                    
-                                    // Check each cluster for this peer
-                                    for cluster in &app_state.clusters {
-                                        let peers_file = clusters_dir.join(cluster).join("known_peers.toml");
-                                        if peers_file.exists() {
-                                            if let Ok(mut known_peers) = toml::from_str::<toml::Table>(&fs::read_to_string(&peers_file)?) {
-                                                if let Some(peer_info) = known_peers.get_mut(&peer_id.to_string()) {
-                                                    if let Some(info_table) = peer_info.as_table_mut() {
-                                                        info_table.insert("last_working_addr".into(), toml::Value::String(addr.to_string()));
-                                                        info_table.insert("last_seen".into(), toml::Value::Integer(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64));
-                                                        fs::write(&peers_file, toml::to_string(&known_peers)?)?;
-                                                        println!("Updated working address for peer: {}", addr);
-                                                        
-                                                        // Start providing the cluster topic again to maintain visibility
-                                                        let topic = format!("lis-cluster:{}", cluster);
-                                                        let _ = swarm.behaviour_mut().kademlia.start_providing(topic.as_bytes().to_vec().into());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
                                 }
-                                let mut peers = connected_peers.lock().await;
-                                peers.insert(peer_id);
                             }
-                            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                                println!("Disconnected from peer: {}", peer_id);
-                                let mut peers = connected_peers.lock().await;
-                                peers.remove(&peer_id);
-                                // Remove peer from all clusters it was in
-                                for peers in cluster_peers.values_mut() {
-                                    peers.remove(&peer_id);
-                                }
+                            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                                println!("❌ Disconnected from peer: {} (cause: {:?})", peer_id, cause);
                             }
                             _ => {}
                         }
@@ -1821,17 +1897,19 @@ where
 }
 
 async fn handle_connection(addr: Multiaddr, mut transport: Boxed<(PeerId, StreamMuxerBox)>, _peer_id: PeerId) -> Result<()> {
-    use libp2p::core::{transport::{DialOpts, PortUse}, connection::Endpoint};
+    use libp2p::core::transport::DialOpts;
+    use libp2p::core::connection::Endpoint;
+    use libp2p::core::transport::PortUse;
+    
     let dial_opts = DialOpts {
         role: Endpoint::Dialer,
         port_use: PortUse::New,
     };
-    let fut = transport.dial(addr, dial_opts)?;
     
-    match fut.await {
+    let future = transport.dial(addr, dial_opts)?;
+    match future.await {
         Ok((_peer_id, mut connection)) => {
-            use futures::task::noop_waker_ref;
-            if let Poll::Ready(Ok(substream)) = StreamMuxerExt::poll_outbound_unpin(&mut connection, &mut Context::from_waker(noop_waker_ref())) {
+            if let Poll::Ready(Ok(substream)) = StreamMuxerExt::poll_outbound_unpin(&mut connection, &mut Context::from_waker(futures::task::noop_waker_ref())) {
                 handle_stream(substream).await?;
             }
         }
@@ -1841,4 +1919,9 @@ async fn handle_connection(addr: Multiaddr, mut transport: Boxed<(PeerId, Stream
     }
     
     Ok(())
+}
+
+fn create_noise_config(local_key: &identity::Keypair) -> std::io::Result<noise::Config> {
+    noise::Config::new(local_key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
