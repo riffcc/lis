@@ -19,7 +19,7 @@ hex = "0.4"
 nix = { version = "0.28", features = ["mount"] }
 rand = "0.8"
 ctrlc = "3.4"
-libp2p = { version = "0.55.0", features = ["tokio", "dns", "kad", "identify", "ping", "tcp", "noise", "yamux", "macros", "serde", "mdns", "relay", "dcutr"] }
+libp2p = { version = "0.55.0", features = ["full", "rsa", "tokio", "dns", "quic", "kad", "identify", "ping", "tcp", "noise", "yamux", "macros", "serde", "mdns", "relay", "dcutr"] }
 libp2p-relay = "0.19.0"
 libp2p-dcutr = "0.13.0"
 tokio = { version = "1.36", features = ["full"] }

@@ -36,8 +36,9 @@ use libp2p::{
     SwarmBuilder,
     identify,
     Transport,
+    dns,
 };
-use nix::mount::{self, MntFlags};
+use nix::mount::{self};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
@@ -242,7 +243,7 @@ impl AppState {
         println!("Local peer ID: {}", local_peer_id);
         self.peer_id = Some(local_peer_id);
 
-        // Create behaviours
+        // Create behaviours with more aggressive timeouts
         let store = MemoryStore::new(local_peer_id);
         let mut kad = Kademlia::new(local_peer_id, store);
         let relay = {
@@ -263,37 +264,23 @@ impl AppState {
         kad.set_mode(Some(libp2p::kad::Mode::Server));
         
         // Add bootstrap nodes with better error handling
-        let mut bootstrap_addresses = Vec::new();
-        let mut bootstrap_peer_ids = HashSet::new();
-        for node in BOOTSTRAP_NODES.iter() {
-            match node.parse::<Multiaddr>() {
-                Ok(addr) => {
-                    if let Some(peer_id) = addr.iter().find_map(|p| {
-                        if let libp2p::multiaddr::Protocol::P2p(hash) = p {
-                            Some(PeerId::from(hash))
-                        } else {
-                            None
-                        }
-                    }) {
-                        println!("Adding bootstrap node: {} ({})", addr, peer_id);
-                        bootstrap_peer_ids.insert(peer_id);
-                        // Add the address without the peer ID component for dialing
-                        let mut dial_addr = addr.clone();
-                        dial_addr.pop(); // Remove the /p2p/... component
-                        kad.add_address(&peer_id, dial_addr.clone());
-                        bootstrap_addresses.push((peer_id, addr.clone()));
-                    }
-                }
-                Err(e) => {
-                    println!("Failed to parse bootstrap node address {}: {}", node, e);
-                    continue;
-                }
-            }
-        }
+        let mut bootstrap_addresses: Vec<(PeerId, Multiaddr)> = Vec::new();
+        let mut bootstrap_peer_ids: HashSet<PeerId> = HashSet::new();
+        
+        // Create the transport with more aggressive timeouts
+        let tcp_config = tcp::Config::default()
+            .nodelay(true);
+        
+        let yamux_config = yamux::Config::default();
+        
+        let transport = libp2p::dns::tokio::Transport::system(libp2p::tcp::tokio::Transport::new(tcp_config.clone()))?
+            .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+            .authenticate(noise::Config::new(&local_key).expect("signing libp2p-noise static keypair"))
+            .multiplex(yamux_config)
+            .timeout(Duration::from_secs(20))
+            .boxed();
 
-        // Store bootstrap peers in the struct for tracking
-        self.bootstrap_peers = Some(bootstrap_peer_ids);
-
+        // Build the swarm with custom configuration
         let behaviour = LisNetworkBehaviour {
             kademlia: kad,
             relay,
@@ -301,38 +288,21 @@ impl AppState {
             identify,
         };
 
-        // Create a Swarm with more aggressive timeouts
-        let mut swarm = {
-            // Create the transport with more aggressive timeouts
-            let tcp_config = tcp::Config::default()
-                .nodelay(true);
-            
-            let yamux_config = yamux::Config::default();
-            
-            let transport = libp2p::tcp::tokio::Transport::new(tcp_config.clone())
-                .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-                .authenticate(noise::Config::new(&local_key).expect("signing libp2p-noise static keypair"))
-                .multiplex(yamux_config)
-                .timeout(Duration::from_secs(20))
-                .boxed();
-
-            // Build the swarm with custom configuration
-            SwarmBuilder::with_existing_identity(local_key.clone())
-                .with_tokio()
-                .with_tcp(
-                    tcp_config,
-                    noise::Config::new,
-                    yamux::Config::default,
-                )?
-                .with_behaviour(|_| behaviour)?
-                .with_swarm_config(|cfg| {
-                    cfg.with_idle_connection_timeout(Duration::from_secs(60))
-                       .with_dial_concurrency_factor(std::num::NonZeroU8::new(4).unwrap())
-                       .with_notify_handler_buffer_size(std::num::NonZeroUsize::new(32).unwrap())
-                       .with_per_connection_event_buffer_size(64)
-                })
-                .build()
-        };
+        let mut swarm = SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(
+                tcp_config,
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_behaviour(|_| Ok(behaviour))?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(Duration::from_secs(60))
+                   .with_dial_concurrency_factor(std::num::NonZeroU8::new(4).unwrap())
+                   .with_notify_handler_buffer_size(std::num::NonZeroUsize::new(32).unwrap())
+                   .with_per_connection_event_buffer_size(64)
+            })
+            .build();
 
         // Listen on all interfaces
         println!("Attempting to listen on port {}", DEFAULT_PORT);
@@ -911,6 +881,9 @@ impl AppState {
         if let Some(swarm) = &self.swarm {
             let mut swarm = swarm.lock().await;
             
+            // Store bootstrap peers for tracking
+            let mut bootstrap_peer_ids: HashSet<PeerId> = HashSet::new();
+            
             for node in BOOTSTRAP_NODES.iter() {
                 println!("Processing bootstrap node: {}", node);
                 match node.parse::<Multiaddr>() {
@@ -922,8 +895,13 @@ impl AppState {
                                 None
                             }
                         }) {
+                            bootstrap_peer_ids.insert(peer_id);
+                            
                             // Extract base address without peer ID and port
                             let mut base_addr = Multiaddr::empty();
+                            let mut has_tcp = false;
+                            let mut has_quic = false;
+                            
                             for proto in addr.iter() {
                                 match proto {
                                     libp2p::multiaddr::Protocol::Ip4(ip) => {
@@ -940,28 +918,65 @@ impl AppState {
                                     }
                                     libp2p::multiaddr::Protocol::Dnsaddr(host) => {
                                         base_addr.push(libp2p::multiaddr::Protocol::Dns(host.clone()));
-                                        println!("Found DNSAddr: {}", host);
+                                        println!("Found DNSAddr (converting to DNS): {}", host);
+                                    }
+                                    libp2p::multiaddr::Protocol::Tcp(port) => {
+                                        has_tcp = true;
+                                        base_addr.push(libp2p::multiaddr::Protocol::Tcp(port));
+                                    }
+                                    libp2p::multiaddr::Protocol::QuicV1 => {
+                                        has_quic = true;
                                     }
                                     _ => {}
                                 }
                             }
 
-                            // Create dial address with TCP port 4001
-                            let mut dial_addr = base_addr.clone();
-                            dial_addr.push(libp2p::multiaddr::Protocol::Tcp(4001));
-                            dial_addr.push(libp2p::multiaddr::Protocol::P2p(peer_id.into()));
+                            // Create dial addresses for all supported protocols
+                            let mut dial_addrs = Vec::new();
                             
-                            println!("Attempting to dial bootstrap node {} at {}", peer_id, dial_addr);
-                            swarm.behaviour_mut().kademlia.add_address(&peer_id, dial_addr.clone());
-                            
-                            match swarm.dial(dial_addr.clone()) {
-                                Ok(_) => {
-                                    println!("Successfully initiated connection to {} at {}", peer_id, dial_addr);
-                                    // Give some time for the connection attempt
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                }
-                                Err(e) => println!("Failed to dial {} at {}: {}", peer_id, dial_addr, e),
+                            // For DNS addresses, use the original address
+                            if base_addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::Dns(_) | libp2p::multiaddr::Protocol::Dnsaddr(_))) {
+                                dial_addrs.push(addr.clone());
+                            } else {
+                                // For IP addresses, try standard ports
+                                let mut tcp_addr = base_addr.clone();
+                                tcp_addr.push(libp2p::multiaddr::Protocol::Tcp(4001));
+                                tcp_addr.push(libp2p::multiaddr::Protocol::P2p(peer_id.into()));
+                                dial_addrs.push(tcp_addr);
                             }
+                            
+                            // Try original port if specified
+                            if has_tcp {
+                                dial_addrs.push(addr.clone());
+                            }
+                            
+                            // Try QUIC if supported
+                            if has_quic {
+                                let mut quic_addr = base_addr.clone();
+                                quic_addr.push(libp2p::multiaddr::Protocol::Udp(4001));
+                                quic_addr.push(libp2p::multiaddr::Protocol::QuicV1);
+                                quic_addr.push(libp2p::multiaddr::Protocol::P2p(peer_id.into()));
+                                dial_addrs.push(quic_addr);
+                            }
+                            
+                            // Add all addresses to Kademlia
+                            for addr in &dial_addrs {
+                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                            }
+                            
+                            // Try dialing each address
+                            for dial_addr in dial_addrs {
+                                println!("Attempting to dial bootstrap node {} at {}", peer_id, dial_addr);
+                                match swarm.dial(dial_addr.clone()) {
+                                    Ok(_) => {
+                                        println!("Successfully initiated connection to {} at {}", peer_id, dial_addr);
+                                    }
+                                    Err(e) => println!("Failed to dial {} at {}: {}", peer_id, dial_addr, e),
+                                }
+                            }
+                            
+                            // Small delay between connection attempts
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         } else {
                             println!("No peer ID found in multiaddr: {}", addr);
                         }
@@ -970,15 +985,44 @@ impl AppState {
                 }
             }
             
-            // Wait a bit longer for connections to establish
-            println!("Waiting for connections to establish...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            self.bootstrap_peers = Some(bootstrap_peer_ids);
             
-            // Print current connection status
-            let connected_peers = swarm.connected_peers().count();
-            println!("Current connection status: {} peers connected", connected_peers);
-            for peer in swarm.connected_peers() {
-                println!("Connected to peer: {}", peer);
+            // Wait for initial connections
+            println!("Waiting for initial connections...");
+            let mut attempts = 0;
+            while attempts < 30 {
+                let connected = swarm.connected_peers().count();
+                if connected > 0 {
+                    println!("Successfully connected to {} peers", connected);
+                    break;
+                }
+                
+                // Process any pending events
+                while let Poll::Ready(Some(event)) = futures::Stream::poll_next(Pin::new(&mut *swarm), &mut Context::from_waker(futures::task::noop_waker_ref())) {
+                    match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            println!("🌟 Connected to peer: {}", peer_id);
+                        }
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            println!("⚠️ Connection error to {:?}: {}", peer_id, error);
+                        }
+                        _ => {}
+                    }
+                }
+                
+                attempts += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if attempts % 5 == 0 {
+                    println!("Still waiting for connections... ({}/30s)", attempts);
+                }
+            }
+            
+            // Start the bootstrap process if we have any connections
+            if swarm.connected_peers().count() > 0 {
+                println!("Starting DHT bootstrap...");
+                swarm.behaviour_mut().kademlia.bootstrap()?;
+            } else {
+                println!("Warning: No connections established, bootstrap may fail");
             }
         }
         Ok(())
@@ -1002,7 +1046,7 @@ impl AppState {
                 // Track connected peers
                 connected_peers.extend(swarm.connected_peers().cloned());
                 
-                if !bootstrap_attempted {
+                if !bootstrap_attempted && !connected_peers.is_empty() {
                     println!("Starting DHT bootstrap with {} connected peers...", connected_peers.len());
                     swarm.behaviour_mut().kademlia.bootstrap()?;
                     bootstrap_attempted = true;
@@ -1021,6 +1065,12 @@ impl AppState {
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             println!("Connected to peer: {}", peer_id);
                             connected_peers.insert(peer_id);
+                            
+                            // Try to bootstrap again with new peer
+                            if bootstrap_attempted {
+                                println!("Retrying bootstrap with newly connected peer...");
+                                swarm.behaviour_mut().kademlia.bootstrap()?;
+                            }
                         }
                         _ => {}
                     }
