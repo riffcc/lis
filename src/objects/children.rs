@@ -1,10 +1,10 @@
 use crate::{
     doc::LisDoc,
-    objects::{dir::LisDir, FromNamespaceId, ObjectType},
+    objects::{dir::LisDir, FromNamespaceId, Object},
     prelude::*,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Children {
     doc: LisDoc,
 }
@@ -20,7 +20,7 @@ impl Children {
         Ok((Self { doc }, id))
     }
 
-    pub async fn get(&self, node: &Iroh, path: PathBuf) -> Result<Option<ObjectType>> {
+    pub async fn get(&self, node: &Iroh, path: PathBuf) -> Result<Option<Object>> {
         if path.components().count() != 1 {
             return Err(anyhow!("Incorrect path, more than one component"));
         }
@@ -32,8 +32,8 @@ impl Children {
         let doc_id = bytes_to_namespace_id(content)?;
         // lisdir or file from doc id
         // TODO: support files
-        Ok(Some(ObjectType::Dir(
-            LisDir::from_namespace_id(node, doc_id).await?, // TODO: from_namespace_id for ObjectType
+        Ok(Some(Object::Dir(
+            LisDir::from_namespace_id(node, doc_id).await?, // TODO: from_namespace_id for Object
         )))
     }
 

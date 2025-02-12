@@ -1,9 +1,10 @@
 use crate::{
     doc::LisDoc,
-    objects::{FromNamespaceId, Metadata, ObjectType},
+    objects::{FromNamespaceId, Metadata},
     prelude::*,
 };
 
+#[derive(Debug, Clone, Default)]
 pub struct LisFile {
     doc: LisDoc,
     chunks: Chunks,
@@ -74,6 +75,7 @@ impl FromNamespaceId for LisFile {
     }
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct Chunks {
     doc: LisDoc,
 }

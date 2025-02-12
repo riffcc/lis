@@ -12,7 +12,7 @@ mod cli;
 pub use cli::{Cli, Commands};
 
 mod objects;
-use objects::{dir::LisDir, file::LisFile, LisRoot, ObjectType};
+use objects::{dir::LisDir, file::LisFile, LisRoot, Object};
 
 pub struct Lis {
     pub iroh_node: Node<Store>,
@@ -54,8 +54,8 @@ impl Lis {
 
     pub async fn create_file(&mut self, full_path: &Path) -> Result<()> {
         match self.root.find(self.iroh_node.client(), full_path).await? {
-            Some(ObjectType::File(_file)) => return Err(anyhow!("File exists")),
-            Some(ObjectType::Dir(_dir)) => return Err(anyhow!("Path is a directory")),
+            Some(Object::File(_file)) => return Err(anyhow!("File exists")),
+            Some(Object::Dir(_dir)) => return Err(anyhow!("Path is a directory")),
             None => {}
         }
 
@@ -68,8 +68,8 @@ impl Lis {
                 "Could not find doc for parent dir {}",
                 parent_path.display()
             ))? {
-            ObjectType::File(_file) => return Err(anyhow!("Parent is a file")),
-            ObjectType::Dir(dir) => dir,
+            Object::File(_file) => return Err(anyhow!("Parent is a file")),
+            Object::Dir(dir) => dir,
         };
 
         let relpath = get_relative_path(full_path, parent_path)
@@ -92,8 +92,8 @@ impl Lis {
 
     pub async fn create_dir(&mut self, full_path: &Path) -> Result<()> {
         match self.root.find(self.iroh_node.client(), full_path).await? {
-            Some(ObjectType::File(_file)) => return Err(anyhow!("Path is a file")),
-            Some(ObjectType::Dir(_dir)) => return Err(anyhow!("Directory exists")),
+            Some(Object::File(_file)) => return Err(anyhow!("Path is a file")),
+            Some(Object::Dir(_dir)) => return Err(anyhow!("Directory exists")),
             None => {}
         }
 
@@ -106,8 +106,8 @@ impl Lis {
                 "Could not find doc for parent dir {}",
                 parent_path.display()
             ))? {
-            ObjectType::File(_file) => return Err(anyhow!("Parent is a file")),
-            ObjectType::Dir(dir) => dir,
+            Object::File(_file) => return Err(anyhow!("Parent is a file")),
+            Object::Dir(dir) => dir,
         };
 
         let relpath = get_relative_path(full_path, parent_path)
@@ -130,8 +130,8 @@ impl Lis {
 
     pub async fn list(&self, full_path: &Path) -> Result<Vec<PathBuf>> {
         let dir: LisDir = match self.root.find(self.iroh_node.client(), full_path).await? {
-            Some(ObjectType::Dir(dir)) => dir,
-            Some(ObjectType::File(_file)) => return Err(anyhow!("Path is a file")),
+            Some(Object::Dir(dir)) => dir,
+            Some(Object::File(_file)) => return Err(anyhow!("Path is a file")),
             None => return Err(anyhow!("Path not found")),
         };
 

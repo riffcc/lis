@@ -4,11 +4,11 @@ use iroh::docs::NamespaceId;
 
 use crate::{
     doc::LisDoc,
-    objects::{Children, FromNamespaceId, LisFile, Metadata, ObjectType},
+    objects::{Children, FromNamespaceId, LisFile, Metadata, Object, ObjectAttributes},
     prelude::*,
 };
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LisDir {
     doc: LisDoc,
     children: Children,
@@ -16,7 +16,7 @@ pub struct LisDir {
 }
 
 struct DirEntry {
-    entry_type: ObjectType,
+    entry_type: Object,
     key: Key,
 }
 
@@ -52,11 +52,11 @@ impl LisDir {
         ))
     }
 
-    pub async fn get(&self, node: &Iroh, path: PathBuf) -> Result<Option<ObjectType>> {
+    pub async fn get(&self, node: &Iroh, path: PathBuf) -> Result<Option<Object>> {
         self.children.get(node, path).await
     }
 
-    pub async fn find(&self, node: &Iroh, path: &Path) -> Result<Option<ObjectType>> {
+    pub async fn find(&self, node: &Iroh, path: &Path) -> Result<Option<Object>> {
         let mut cur_dir = self.clone();
         for component in path.components() {
             match component {
@@ -64,17 +64,17 @@ impl LisDir {
                     let cur_path = Path::new(osstr);
                     debug!("cur_path={}", cur_path.display());
                     match cur_dir.get(&node.clone(), cur_path.into()).await? {
-                        Some(ObjectType::Dir(next_dir)) => {
+                        Some(Object::Dir(next_dir)) => {
                             cur_dir = next_dir;
                         }
-                        Some(ObjectType::File(file)) => return Ok(Some(ObjectType::File(file))),
+                        Some(Object::File(file)) => return Ok(Some(Object::File(file))),
                         None => return Ok(None),
                     }
                 }
                 _ => return Err(anyhow!("Invalid component in path")),
             }
         }
-        Ok(Some(ObjectType::Dir(cur_dir)))
+        Ok(Some(Object::Dir(cur_dir)))
     }
 
     pub fn id(&self) -> NamespaceId {
@@ -87,7 +87,14 @@ impl LisDir {
         self.children
             .put(node, path.to_path_buf(), object_id)
             .await?;
-        self.metadata.attrs.items += 1;
+        if let ObjectAttributes::DirAttributes { items } = &mut self.metadata.attrs {
+            *items += 1;
+        } else {
+            return Err(anyhow!(
+                "Could not access dir attributes: incorrect attributes type (expected DirAttributes)"
+            ));
+        }
+
         self.metadata.save(&node).await
     }
 

@@ -2,7 +2,7 @@ use futures_lite::stream::StreamExt; // For collect
 
 use crate::{objects::FromNamespaceId, prelude::*, util};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LisDoc {
     doc_id: NamespaceId,
 }

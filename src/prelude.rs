@@ -28,7 +28,7 @@ pub use tokio::{fs::File, io::AsyncReadExt, io::AsyncWriteExt};
 pub use crate::doc::DocType;
 #[allow(unused)]
 pub use crate::util::*;
-pub use crate::{objects::ObjectType, Lis};
+pub use crate::{objects::Object, Lis};
 
 pub const DEFAULT_CHUNK_SIZE: usize = 512;
 pub const MAX_NAME_LENGTH: u32 = 255;

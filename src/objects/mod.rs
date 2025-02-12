@@ -5,6 +5,7 @@ use children::Children;
 
 pub mod metadata;
 use metadata::Metadata;
+use metadata::ObjectAttributes;
 
 pub mod file;
 use file::LisFile;
@@ -15,9 +16,13 @@ use dir::LisDir;
 pub mod inode;
 use inode::InodeMap;
 
-pub enum ObjectType {
+pub enum Object {
     File(LisFile),
     Dir(LisDir),
+}
+pub enum ObjectType {
+    File,
+    Dir,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,9 +62,9 @@ impl LisRoot {
         }
     }
 
-    pub async fn find(&self, node: &Iroh, full_path: &Path) -> Result<Option<ObjectType>> {
+    pub async fn find(&self, node: &Iroh, full_path: &Path) -> Result<Option<Object>> {
         if full_path == Path::new("/") {
-            return Ok(Some(ObjectType::Dir(self.dir.clone())));
+            return Ok(Some(Object::Dir(self.dir.clone())));
         };
 
         // remove root from path

@@ -3,18 +3,20 @@ use bytes::Bytes;
 use crate::{doc::LisDoc, objects::FromNamespaceId, prelude::*};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum ObjectAttributes {
+pub enum ObjectAttributes {
     FileAttributes { chunks: usize, chunk_size: usize },
     DirAttributes { items: usize },
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Metadata {
+pub struct Metadata<ObjectType> {
     doc: LisDoc,
     pub kind: String,
     pub attrs: ObjectAttributes,
 }
+
 impl Metadata {
-    pub async fn new(node: &Iroh, object_type: ObjectType) -> Result<(Self, NamespaceId)> {
+    pub async fn new<T: ObjectType>(node: &Iroh) -> Result<(Self, NamespaceId)> {
         let doc = LisDoc::new(&node.clone()).await?;
         let id = doc.id();
 
@@ -23,7 +25,7 @@ impl Metadata {
             .await?;
 
         let metadata = match object_type {
-            ObjectType::File(_file) => {
+            ObjectType::File => {
                 let attrs = ObjectAttributes::FileAttributes {
                     chunks: 0,
                     chunk_size: DEFAULT_CHUNK_SIZE,
@@ -34,7 +36,7 @@ impl Metadata {
                     attrs,
                 }
             }
-            ObjectType::Dir(_dir) => {
+            ObjectType::Dir => {
                 let attrs = ObjectAttributes::DirAttributes { items: 0 };
                 Self {
                     doc,
@@ -101,7 +103,8 @@ impl FromNamespaceId for Metadata {
         let kind = String::from_utf8(
             doc.get(node, Key::from("kind".to_string()))
                 .await?
-                .ok_or(anyhow!("Could not find kind key in doc"))?,
+                .ok_or(anyhow!("Could not find kind key in doc"))?
+                .to_vec(),
         )?;
 
         let attrs = match kind.as_ref() {
@@ -132,6 +135,7 @@ impl FromNamespaceId for Metadata {
                 );
                 ObjectAttributes::DirAttributes { items }
             }
+            _ => return Err(anyhow!("Unknown doc type, expected 'file' or 'dir'.")),
         };
 
         Ok(Self { doc, kind, attrs })
