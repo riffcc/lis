@@ -74,7 +74,7 @@ impl LisDoc {
 }
 
 impl FromNamespaceId for LisDoc {
-    async fn from_namespace_id(node: &Iroh, id: NamespaceId) -> Result<Self> {
+    async fn from_namespace_id(_node: &Iroh, id: NamespaceId) -> Result<Self> {
         Ok(Self { doc_id: id })
     }
 }

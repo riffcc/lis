@@ -1,6 +1,10 @@
 use bytes::Bytes;
 
-use crate::{doc::LisDoc, objects::FromNamespaceId, prelude::*};
+use crate::{
+    doc::LisDoc,
+    objects::{FromNamespaceId, ObjectType},
+    prelude::*,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ObjectAttributes {
@@ -9,14 +13,14 @@ pub enum ObjectAttributes {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Metadata<ObjectType> {
+pub struct Metadata {
     doc: LisDoc,
     pub kind: String,
     pub attrs: ObjectAttributes,
 }
 
 impl Metadata {
-    pub async fn new<T: ObjectType>(node: &Iroh) -> Result<(Self, NamespaceId)> {
+    pub async fn new(node: &Iroh, object_type: ObjectType) -> Result<(Self, NamespaceId)> {
         let doc = LisDoc::new(&node.clone()).await?;
         let id = doc.id();
 
@@ -45,7 +49,7 @@ impl Metadata {
                 }
             }
         };
-        metadata.save(node);
+        metadata.save(node).await?;
 
         Ok((metadata, id))
     }

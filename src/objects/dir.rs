@@ -4,26 +4,21 @@ use iroh::docs::NamespaceId;
 
 use crate::{
     doc::LisDoc,
-    objects::{Children, FromNamespaceId, LisFile, Metadata, Object, ObjectAttributes},
+    objects::{Children, FromNamespaceId, Metadata, ObjectAttributes, ObjectType},
     prelude::*,
 };
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LisDir {
     doc: LisDoc,
     children: Children,
-    metadata: Metadata<ObjectType::Dir>,
-}
-
-struct DirEntry {
-    entry_type: Object,
-    key: Key,
+    metadata: Metadata,
 }
 
 impl LisDir {
     pub async fn new(node: &Iroh) -> Result<(Self, NamespaceId)> {
         let (children, children_id) = Children::new(&node.clone()).await?;
-        let (metadata, metadata_id) = Metadata::new(&node.clone()).await?;
+        let (metadata, metadata_id) = Metadata::new(&node.clone(), ObjectType::Dir).await?;
 
         let doc = LisDoc::new(node).await?;
         doc.set(

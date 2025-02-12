@@ -1,20 +1,20 @@
 use crate::{
     doc::LisDoc,
-    objects::{FromNamespaceId, Metadata},
+    objects::{FromNamespaceId, Metadata, ObjectType},
     prelude::*,
 };
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LisFile {
     doc: LisDoc,
     chunks: Chunks,
-    metadata: Metadata<ObjectType::File>,
+    metadata: Metadata,
 }
 
 impl LisFile {
     pub async fn new(node: &Iroh) -> Result<(Self, NamespaceId)> {
         let (chunks, chunks_id) = Chunks::new(&node.clone()).await?;
-        let (metadata, metadata_id) = Metadata::new(&node.clone()).await?;
+        let (metadata, metadata_id) = Metadata::new(&node.clone(), ObjectType::File).await?;
 
         let doc = LisDoc::new(node).await?;
         doc.set(
@@ -75,7 +75,7 @@ impl FromNamespaceId for LisFile {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Chunks {
     doc: LisDoc,
 }

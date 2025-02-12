@@ -3,7 +3,6 @@ use std::str;
 
 use iroh::docs::NamespaceId;
 
-use crate::doc::LisDoc;
 use crate::prelude::*;
 
 pub struct Key(Bytes);
