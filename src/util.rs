@@ -50,6 +50,17 @@ impl From<&[u8]> for Key {
     }
 }
 
+impl From<usize> for Key {
+    fn from(k: usize) -> Self {
+        Key(Bytes::copy_from_slice(&(k as u64).to_le_bytes()))
+    }
+}
+impl From<u8> for Key {
+    fn from(k: u8) -> Self {
+        Key(Bytes::copy_from_slice(&k.to_le_bytes()))
+    }
+}
+
 impl From<NamespaceId> for Key {
     fn from(id: NamespaceId) -> Self {
         Key(namespace_id_to_bytes(id))

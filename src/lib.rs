@@ -52,7 +52,7 @@ impl Lis {
         Ok(lis)
     }
 
-    pub async fn create_file(&mut self, full_path: &Path) -> Result<()> {
+    pub async fn create_file(&mut self, full_path: &Path) -> Result<LisFile> {
         match self.root.find(self.iroh_node.client(), full_path).await? {
             Some(Object::File(_file)) => return Err(anyhow!("File exists")),
             Some(Object::Dir(_dir)) => return Err(anyhow!("Path is a directory")),
@@ -83,11 +83,11 @@ impl Lis {
             relpath.display()
         );
 
-        let (_file, file_id) = LisFile::new(self.iroh_node.client()).await?;
+        let (file, file_id) = LisFile::new(self.iroh_node.client()).await?;
         parent_dir
             .put(self.iroh_node.client(), &relpath, file_id)
             .await?;
-        Ok(())
+        Ok(file)
     }
 
     pub async fn create_dir(&mut self, full_path: &Path) -> Result<()> {
@@ -153,7 +153,7 @@ mod tests {
             .expect("Could not create new Lis node")
     }
     #[tokio::test]
-    async fn test_create_dir() {
+    async fn create_dir() {
         let tmp_dir = TempDir::new().unwrap();
         let mut lis = setup_lis(&tmp_dir).await;
 
@@ -179,7 +179,7 @@ mod tests {
         assert!(lis.create_dir(&Path::new("/1/2/3")).await.is_err());
     }
     #[tokio::test]
-    async fn test_create_file() {
+    async fn create_file() {
         let tmp_dir = TempDir::new().unwrap();
         let mut lis = setup_lis(&tmp_dir).await;
 
@@ -200,5 +200,36 @@ mod tests {
 
         // create /dir/file (again, error: file exists)
         assert!(lis.create_file(&Path::new("/dir/file")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_write_file() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut lis = setup_lis(&tmp_dir).await;
+
+        let mut file = lis.create_file(&Path::new("/file")).await.unwrap();
+
+        let hello_world = "hello world".as_bytes();
+        file.write(&lis.iroh_node, 0, hello_world.into())
+            .await
+            .unwrap();
+        let actual = file.read_all(&lis.iroh_node).await.unwrap();
+        assert_eq!(hello_world, actual);
+
+        let another_string = "another string".as_bytes();
+        file.write(&lis.iroh_node, hello_world.len(), another_string.into())
+            .await
+            .unwrap();
+        let actual = file.read_all(&lis.iroh_node).await.unwrap();
+        assert_eq!("hello worldanother string".as_bytes(), actual);
+
+        // read only after "hello world" (only read "another string")
+        let offset = hello_world.len();
+        assert_eq!(
+            "another string".as_bytes(),
+            file.read(&lis.iroh_node, offset, another_string.len())
+                .await
+                .unwrap()
+        );
     }
 }
