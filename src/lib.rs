@@ -8,6 +8,9 @@ use util::get_relative_path;
 
 mod doc;
 
+mod node;
+use node::LisNode;
+
 mod cli;
 pub use cli::{Cli, Commands};
 
@@ -15,37 +18,34 @@ mod objects;
 use objects::{dir::LisDir, file::LisFile, LisRoot, Object};
 
 pub struct Lis {
-    pub iroh_node: Node<Store>,
-    _iroh_dir: PathBuf,
+    pub node: LisNode,
+    dir: PathBuf,
     pub rt: tokio::runtime::Handle,
     root: LisRoot,
 }
 
 impl Lis {
     /// Creates new Lis node
-    /// If `iroh_dir` path does not exist, it is created with `mkdir -p`
-    /// If an Iroh node is not found in `iroh_dir`, a new one is created
+    /// If `dir` path does not exist, it is created with `mkdir -p`
+    /// If a LisNode is not found in `dir`, a new one is created
     ///
-    /// If an Iroh node is found in `iroh_dir` and `overwrite` is `false`, load it,
+    /// If a LisNode is found in `dir` and `overwrite` is `false`, load it,
     /// otherwise truncate it
-    pub async fn new(iroh_dir: &Path, overwrite: bool) -> Result<Self> {
+    pub async fn new(dir: &Path, overwrite: bool) -> Result<Self> {
         if overwrite {
             // remove old root dir if one existed before
-            let _ = fs::remove_dir_all(iroh_dir).await;
+            let _ = fs::remove_dir_all(dir).await;
         }
         // create root if not exists
-        fs::create_dir_all(iroh_dir).await?;
+        fs::create_dir_all(dir).await?;
 
-        let iroh_node = iroh::node::Node::persistent(iroh_dir)
-            .await?
-            .spawn()
-            .await?;
+        let node = node::LisNode::new(dir).start();
 
-        let root = LisRoot::load(iroh_node.client(), iroh_dir).await?;
+        let root = LisRoot::load(iroh_node.client(), dir).await?;
 
         let lis = Lis {
-            iroh_node,
-            _iroh_dir: iroh_dir.to_path_buf(),
+            node,
+            dir: dir.to_path_buf(),
             rt: tokio::runtime::Handle::current(),
             root,
         };
