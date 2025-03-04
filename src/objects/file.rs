@@ -62,6 +62,10 @@ impl LisFile {
         Ok((chunks - 1) * chunk_size + last_chunk_bytes.len())
     }
     pub async fn read(&self, node: &Iroh, offset: usize, size: usize) -> Result<Bytes> {
+        if size == 0 {
+            return Ok(Bytes::new());
+        }
+
         let (chunks, chunk_size) = match self.metadata.attrs {
             ObjectAttributes::FileAttributes { chunks, chunk_size } => (chunks, chunk_size),
             _ => return Err(anyhow!("Incorrect file attributes in metadata")),
@@ -70,7 +74,7 @@ impl LisFile {
             return Err(anyhow!("Invalid offset, must be smaller than file size"));
         }
         let start_chunk: usize = offset / chunk_size;
-        let mut end_chunk: usize = (offset + size) / chunk_size;
+        let mut end_chunk: usize = (offset + size - 1) / chunk_size;
         if end_chunk >= chunks {
             end_chunk = chunks.saturating_sub(1);
         }
@@ -94,6 +98,10 @@ impl LisFile {
     }
     /// Returns the number of bytes written to file
     pub async fn write(&mut self, node: &Iroh, offset: usize, bytes: Bytes) -> Result<usize> {
+        if bytes.len() == 0 {
+            return Ok(0);
+        }
+
         if offset > self.size(node).await? {
             return Err(anyhow!(
                 "Invalid offset, must be smaller or equal to file size"
@@ -110,7 +118,7 @@ impl LisFile {
             return Err(anyhow!("Offset is past end of file"));
         }
         // end_chunk can be past end of file, chunks are created
-        let end_chunk: usize = (offset + bytes.len()) / (chunk_size);
+        let end_chunk: usize = (offset + bytes.len() - 1) / chunk_size;
 
         for i in start_chunk..=end_chunk {
             let last_byte_in_chunk = (chunk_size * (i + 1)).min(bytes.len());

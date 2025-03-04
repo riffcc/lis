@@ -27,7 +27,6 @@ fn read_write_benchmark(c: &mut Criterion) {
                 .block_on(lis.create_file(&Path::new(&format!("/file"))))
                 .unwrap();
             let random_bytes: Vec<u8> = (0..1024).map(|_| rng.random()).collect();
-            println!("{}", random_bytes.len());
             rt.block_on(file.write(&lis.iroh_node, 0, random_bytes.clone().into()))
                 .unwrap();
         })

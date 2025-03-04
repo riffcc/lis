@@ -143,6 +143,7 @@ impl Lis {
 mod tests {
     use super::*;
     // use std::io::Write;
+    use rand::{rng, Rng};
     use tempfile::TempDir;
 
     async fn setup_lis(tmp_dir: &TempDir) -> Lis {
@@ -231,5 +232,21 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn read_write_big_file() {
+        // same as read_write_file but exceeding chunk size to test for chunk creation
+        let tmp_dir = TempDir::new().unwrap();
+        let mut lis = setup_lis(&tmp_dir).await;
+
+        let mut file = lis.create_file(&Path::new("/file")).await.unwrap();
+
+        let random_bytes: Vec<u8> = (0..1024).map(|_| rng().random()).collect();
+        file.write(&lis.iroh_node, 0, random_bytes.clone().into())
+            .await
+            .unwrap();
+        let actual = file.read_all(&lis.iroh_node).await.unwrap();
+        assert_eq!(random_bytes, actual);
     }
 }
