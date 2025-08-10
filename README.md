@@ -2,7 +2,7 @@
 Life is short, but data should live forever
 
 ## the world computer
-Lis is a distributed filesystem intended to stretch the boundaries of CAP theorem and provide a unified view of data across multiple nodes, anywhere in the world.
+Lis is an experimental distributed filesystem intended to stretch the boundaries of CAP theorem and provide a unified view of data across multiple nodes, anywhere in the world.
 
 We use Riff Hierarchical Consensus (RHC) to achieve strong consistency and availability while tolerating network partitions.
 
