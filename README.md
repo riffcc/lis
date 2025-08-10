@@ -8,6 +8,21 @@ We use Riff Hierarchical Consensus (RHC) to achieve strong consistency and avail
 
 You can read more about RHC in `docs/rhc.md` (temporarily in the synthesis folder).
 
+## Planned Features
+
+Networking:
+* Fully IPv6 native with support for IPv4
+* Fully georeplicated, with support for multi-tenancy, multi-region and even multi-organization clusters
+
+Practicality:
+* Strong self-hosting support
+* Self-healing and data safety
+* Fast erasure coding
+* Integration with Yggdrasil for effortless NAT traversal
+
+Security:
+* Strong encryption and authentication
+
 ## Installation
 * Install Rust via Rustup: https://rustup.rs/
 * Clone the repository: `git clone https://github.com/riffcc/lis.git && cd lis`
