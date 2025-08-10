@@ -45,6 +45,10 @@ name = "lismount"
 path = "src/bin/lismount.rs"
 
 [[bin]]
+name = "lis-mds"
+path = "src/bin/lis-mds.rs"
+
+[[bin]]
 name = "lis-s3-api"
 path = "src/bin/lis-s3-api.rs"
 

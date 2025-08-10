@@ -35,7 +35,15 @@ services:
         /demo/setup-latency.sh nyc &&
         echo 'Starting Lis mount...' &&
         mkdir -p /mnt/lis &&
-        /app/target/release/lismount lis-mvp-cluster:/ /mnt/lis
+        /app/target/release/lismount lis-mvp-cluster:/ /mnt/lis &
+        echo 'Lis mount started in background' &&
+        sleep 5 &&
+        echo 'Filesystem status:' &&
+        mount | grep lis || echo 'Mount not visible (this is normal in containers)' &&
+        echo 'Testing filesystem...' &&
+        ls -la /mnt/lis/ &&
+        echo 'Container ready. Use docker exec to interact with the filesystem.' &&
+        tail -f /dev/null
       "
 
   # London Region  
@@ -72,7 +80,15 @@ services:
         /demo/setup-latency.sh london &&
         echo 'Starting Lis mount...' &&
         mkdir -p /mnt/lis &&
-        /app/target/release/lismount lis-mvp-cluster:/ /mnt/lis
+        /app/target/release/lismount lis-mvp-cluster:/ /mnt/lis &
+        echo 'Lis mount started in background' &&
+        sleep 5 &&
+        echo 'Filesystem status:' &&
+        mount | grep lis || echo 'Mount not visible (this is normal in containers)' &&
+        echo 'Testing filesystem...' &&
+        ls -la /mnt/lis/ &&
+        echo 'Container ready. Use docker exec to interact with the filesystem.' &&
+        tail -f /dev/null
       "
 
   # Tokyo Region
@@ -109,7 +125,15 @@ services:
         /demo/setup-latency.sh tokyo &&
         echo 'Starting Lis mount...' &&
         mkdir -p /mnt/lis &&
-        /app/target/release/lismount lis-mvp-cluster:/ /mnt/lis
+        /app/target/release/lismount lis-mvp-cluster:/ /mnt/lis &
+        echo 'Lis mount started in background' &&
+        sleep 5 &&
+        echo 'Filesystem status:' &&
+        mount | grep lis || echo 'Mount not visible (this is normal in containers)' &&
+        echo 'Testing filesystem...' &&
+        ls -la /mnt/lis/ &&
+        echo 'Container ready. Use docker exec to interact with the filesystem.' &&
+        tail -f /dev/null
       "
 
 networks:

@@ -37,11 +37,10 @@ pub struct LisFilesystem {
     next_ino: Arc<Mutex<u64>>,
     inodes: Arc<Mutex<HashMap<u64, FileEntry>>>,
     path_to_ino: Arc<Mutex<HashMap<PathBuf, u64>>>,
-    rt_handle: tokio::runtime::Handle,
 }
 
 impl LisFilesystem {
-    pub fn new(rhc_node: Arc<RhcNode>, rt_handle: tokio::runtime::Handle) -> Self {
+    pub fn new(rhc_node: Arc<RhcNode>) -> Self {
         // Create root directory
         let root_attr = FileAttr {
             ino: 1,
@@ -78,7 +77,6 @@ impl LisFilesystem {
             next_ino: Arc::new(Mutex::new(2)),
             inodes: Arc::new(Mutex::new(inodes)),
             path_to_ino: Arc::new(Mutex::new(path_to_ino)),
-            rt_handle,
         }
     }
 
@@ -100,13 +98,22 @@ impl LisFilesystem {
         let path_str = path.to_string_lossy().to_string();
         info!("RHC read: {}", path_str);
         
-        // Use runtime handle to execute async operations from sync context
-        let storage = self.rhc_node.storage();
-        match self.rt_handle.block_on(storage.get(&path_str)) {
-            Ok(Some(data)) => Some(data),
-            Ok(None) => None,
-            Err(e) => {
+        // Clone storage outside the closure to avoid lifetime issues
+        let storage = self.rhc_node.storage().clone();
+        let path_clone = path_str.clone();
+        
+        match std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(storage.get(&path_clone))
+        }).join() {
+            Ok(Ok(Some(data))) => Some(data),
+            Ok(Ok(None)) => None,
+            Ok(Err(e)) => {
                 error!("RHC read error for {}: {}", path_str, e);
+                None
+            }
+            Err(_) => {
+                error!("Thread panic during RHC read for {}", path_str);
                 None
             }
         }
@@ -118,7 +125,7 @@ impl LisFilesystem {
         
         // For MVP, create a simple write operation
         // In production, this would use proper lease management
-        let storage = self.rhc_node.storage();
+        let storage = self.rhc_node.storage().clone();
         let data_owned = data.to_vec();
         
         // Create a write operation
@@ -144,13 +151,20 @@ impl LisFilesystem {
             timestamp: HybridClock::new().now(),
         };
         
-        match self.rt_handle.block_on(storage.apply_operation(&operation)) {
-            Ok(_) => {
+        match std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(storage.apply_operation(&operation))
+        }).join() {
+            Ok(Ok(_)) => {
                 info!("RHC write successful for {}", path_str);
                 true
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("RHC write error for {}: {}", path_str, e);
+                false
+            }
+            Err(_) => {
+                error!("Thread panic during RHC write for {}", path_str);
                 false
             }
         }
@@ -421,22 +435,33 @@ async fn main() -> Result<()> {
     info!("Cluster: {}", cluster);
     info!("Mountpoint: {}", mountpoint);
     
-    // Create RHC node - for MVP, use LocalLeader with auto-discovery
+    // Create RHC node - ALL nodes participate in consensus
     let node_id = NodeId::new();
     let rhc_node = Arc::new(RhcNode::new(
-        NodeRole::LocalLeader,
-        1, // Level 1 - Local leader
+        NodeRole::Hybrid, // All nodes are hybrid - can be local leader AND global arbitrator
+        0, // No artificial hierarchy levels - all nodes are peers
         Arc::new(InMemoryStorage::new()),
-        None, // Will discover peers automatically
+        None, // Peers will be added after creation
     ));
+    
+    // Parse peer addresses from environment
+    if let Ok(peer_addrs) = env::var("LIS_PEER_ADDRS") {
+        info!("Connecting to peers: {}", peer_addrs);
+        for addr in peer_addrs.split(',') {
+            let addr = addr.trim();
+            // For now, just add as peers (networking will be implemented next)
+            let peer_id = NodeId::new(); // TODO: Get actual peer IDs
+            rhc_node.add_peer(peer_id, 0); // All nodes are peers
+            info!("Added peer: {} -> {:?}", addr, peer_id);
+        }
+    }
     
     // Start RHC node
     rhc_node.start().await?;
     info!("RHC node {:?} started", node_id);
     
     // Create filesystem
-    let rt_handle = tokio::runtime::Handle::current();
-    let fs = LisFilesystem::new(rhc_node.clone(), rt_handle);
+    let fs = LisFilesystem::new(rhc_node.clone());
     
     // Mount options for better performance
     let options = vec![

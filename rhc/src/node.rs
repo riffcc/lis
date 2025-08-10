@@ -394,6 +394,14 @@ impl RhcNode {
         self.peers.insert(peer_id, info);
     }
     
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+    
+    pub fn peer_ids(&self) -> Vec<NodeId> {
+        self.peers.iter().map(|entry| *entry.key()).collect()
+    }
+    
     async fn flush_operations(&self) -> Result<()> {
         let ops: Vec<Operation> = {
             let mut pending = self.pending_operations.write();
