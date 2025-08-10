@@ -1,6 +1,18 @@
 [package]
 name = "lis"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+
+[[example]]
+name = "lease_demo"
+path = "examples/lease_demo.rs"
+
+[[example]]
+name = "latency_demo"
+path = "examples/latency_demo.rs"
+
+[[example]]
+name = "cap_demo"
+path = "examples/cap_demo.rs"

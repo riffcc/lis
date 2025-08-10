@@ -4,3 +4,4 @@
 // Starting with the absolute basics and building up from there.
 
 pub mod hlc;
+pub mod leases;
