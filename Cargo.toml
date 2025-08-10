@@ -11,9 +11,9 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Wings <wings@riff.cc>"]
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0"
 repository = "https://github.com/riffcc/lis"
 
 [workspace.dependencies]
@@ -42,6 +42,13 @@ blst = "0.3"
 prost = "0.13"
 prost-types = "0.13"
 tonic = { version = "0.12", features = ["tls"] }
+# FUSE filesystem
+fuser = "0.14"
+libc = "0.2"
+# HTTP API for S3 compatibility
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 [profile.release]
 lto = true

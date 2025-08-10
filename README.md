@@ -9,6 +9,9 @@ We use Riff Hierarchical Consensus (RHC) to achieve strong consistency and avail
 You can read more about RHC in `docs/rhc.md` (temporarily in the synthesis folder).
 
 ## Planned Features
+Performance:
+* Node affinity for local writes, burst-buffer style
+
 
 Networking:
 * Fully IPv6 native with support for IPv4
@@ -36,6 +39,9 @@ Security:
 
 ## Development methodology
 Developing a distributed filesystem nearly from scratch is very difficult.
+
+We will use a combination of iterative development and agile methodologies as well as modern AI-driven software development to build a robust and stable filesystem, with deep test suites and validation suites
+to ensure that the system is developed sanely.
 
 ## Inspirations
 We are heavily inspired by the work of MooseFS, and also by the work of other distributed filesystems such as Ceph.

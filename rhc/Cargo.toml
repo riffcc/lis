@@ -25,6 +25,11 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam = { workspace = true }
 blst = { workspace = true }
+fuser = { workspace = true }
+libc = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -34,6 +39,14 @@ tokio-test = "0.4"
 [[example]]
 name = "rhc_demo"
 path = "examples/rhc_demo.rs"
+
+[[bin]]
+name = "lismount"
+path = "src/bin/lismount.rs"
+
+[[bin]]
+name = "lis-s3-api"
+path = "src/bin/lis-s3-api.rs"
 
 [dependencies.tracing-subscriber]
 version = "0.3"
