@@ -15,7 +15,7 @@ use std::cmp;
 const MAX_CLOCK_DRIFT_MS: u64 = 60_000; // 60 seconds
 
 /// A Hybrid Logical Clock timestamp
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HLCTimestamp {
     /// Physical time component (milliseconds since Unix epoch)
     pub physical: u64,
@@ -68,6 +68,8 @@ pub struct HLC {
     last_physical: AtomicU64,
     /// Logical counter for the last physical time
     last_logical: AtomicU64,
+    /// Optional custom clock function for testing
+    clock_fn: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl HLC {
@@ -76,20 +78,34 @@ impl HLC {
         Self {
             last_physical: AtomicU64::new(0),
             last_logical: AtomicU64::new(0),
+            clock_fn: None,
+        }
+    }
+    
+    /// Create a new HLC with a custom clock function (for testing)
+    pub fn new_with_clock(clock_fn: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        Self {
+            last_physical: AtomicU64::new(0),
+            last_logical: AtomicU64::new(0),
+            clock_fn: Some(clock_fn),
         }
     }
 
     /// Get current physical time in milliseconds since Unix epoch
-    fn physical_now() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before Unix epoch")
-            .as_millis() as u64
+    fn physical_now(&self) -> u64 {
+        if let Some(ref clock_fn) = self.clock_fn {
+            clock_fn()
+        } else {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("System time before Unix epoch")
+                .as_millis() as u64
+        }
     }
 
     /// Generate a new HLC timestamp
     pub fn now(&self) -> HLCTimestamp {
-        let physical_now = Self::physical_now();
+        let physical_now = self.physical_now();
         
         loop {
             // Load last known values
@@ -135,7 +151,7 @@ impl HLC {
     /// Update the HLC with a timestamp received from another node
     /// Returns the new local timestamp after incorporating the remote one
     pub fn update(&self, remote: HLCTimestamp) -> Result<HLCTimestamp, HLCError> {
-        let physical_now = Self::physical_now();
+        let physical_now = self.physical_now();
 
         // Check if remote timestamp is within acceptable drift
         if !remote.is_within_drift(physical_now) {
@@ -343,7 +359,7 @@ mod tests {
         let hlc2 = HLC::new();
         
         // Force same physical time by setting last_physical
-        let physical = HLC::physical_now();
+        let physical = hlc1.physical_now();
         hlc1.last_physical.store(physical, Ordering::SeqCst);
         hlc2.last_physical.store(physical, Ordering::SeqCst);
         
@@ -403,7 +419,7 @@ mod tests {
                     
                     // Simulate receiving timestamp from another node
                     let remote = HLCTimestamp::new(ts.physical + node_id, node_id as u32);
-                    if remote.is_within_drift(HLC::physical_now()) {
+                    if remote.is_within_drift(hlc.physical_now()) {
                         let _ = hlc.update(remote);
                     }
                 }

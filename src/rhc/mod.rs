@@ -5,3 +5,4 @@
 
 pub mod hlc;
 pub mod leases;
+pub mod crdt;
