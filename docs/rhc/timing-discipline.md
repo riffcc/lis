@@ -104,7 +104,7 @@ fn update_hlc(local: &HLC, remote: HLCTimestamp) -> Result<(), HLCError> {
 }
 ```
 
-This is a sanity check, not a correctness requirement!
+This is a sanity check, not a correctness requirement! HLC maintains correct ordering even if physical clocks differ significantly.
 
 ### In Lease Proofs
 
@@ -251,23 +251,31 @@ fn monitor_clock_drift() {
 
 ### 1. Lease Duration Selection
 
-- Minimum: 10 seconds (5x typical clock drift)
+- Minimum: 10 seconds (reasonable for fast handoffs)
 - Default: 30 seconds (good for most uses)
 - Maximum: 300 seconds (for stable, long-lived operations)
 
-### 2. Clock Sync Requirements
+Note: These durations are about operational efficiency, not correctness. HLC ensures correct ordering regardless of clock drift.
 
-- Public internet: ±5 seconds achievable
-- Private network: ±100ms achievable  
-- Same datacenter: ±10ms achievable
+### 2. Clock Sync Benefits (Not Requirements)
+
+While not required for correctness, reasonable clock sync helps with:
+- More intuitive log timestamps
+- Easier debugging and correlation
+- Better performance (less HLC adjustment overhead)
+
+Typical achievable sync:
+- Public internet: ±5 seconds (good enough!)
+- Private network: ±100ms (nice to have)
+- Same datacenter: ±10ms (luxury)
 
 ### 3. Handling Clock Issues
 
-If clock drift detected:
-1. Log warning
-2. Refuse new lease grants
-3. Continue serving reads
-4. Alert operators
+If significant clock drift detected:
+1. Log warning (for operator awareness)
+2. Continue normal operations (HLC handles it)
+3. Optionally alert operators (for investigation)
+4. System remains correct and available
 
 ## Example: Lease Transition Timeline
 
@@ -288,12 +296,13 @@ Write unavailability: ~700ms (T+25.3 to T+26.0)
 ## Safety Analysis
 
 Given:
-- Clock drift < 60s
+- Clock drift < 60s (bounded for sanity, not correctness)
 - Lease duration = 30s  
 - Grace period = 5s
 - Fence propagation < 2s
 
 Proves:
-- No two valid leases can overlap
+- No two valid leases can overlap (HLC ordering ensures this)
 - Bounded unavailability during migration
-- System remains safe under stated assumptions
+- System remains safe even with arbitrary clock skew (thanks to HLC)
+- Physical clock drift affects only performance, never correctness

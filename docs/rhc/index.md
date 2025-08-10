@@ -43,10 +43,10 @@ RHC (Riff.CC Hierarchical Consensus) is a distributed consensus protocol that co
 - Respects leases and consistency settings
 
 ### 7. [Timing Discipline](timing-discipline.md)
-- Bounded clock skew (60s max)
-- Lease duration >> clock drift
-- Overlap windows prevent gaps
-- NTP configuration guidelines
+- HLC handles clock skew gracefully
+- Physical clocks can lie - HLC provides correctness
+- Lease timing uses HLC timestamps, not wall clock
+- NTP is nice but not necessary
 
 ### 8. [HLC Implementation](../about.md)
 - Hybrid Logical Clocks for global ordering
