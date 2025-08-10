@@ -72,6 +72,16 @@ pub struct HLC {
     clock_fn: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
 }
 
+impl std::fmt::Debug for HLC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HLC")
+            .field("last_physical", &self.last_physical)
+            .field("last_logical", &self.last_logical)
+            .field("clock_fn", &self.clock_fn.as_ref().map(|_| "<custom clock fn>"))
+            .finish()
+    }
+}
+
 impl HLC {
     /// Create a new HLC instance
     pub fn new() -> Self {

@@ -195,7 +195,8 @@ mod tests {
         let actor = ActorId::new("node1");
         let mut rga = RGA::new(actor.clone());
         
-        let id1 = rga.insert_after(&rga.root, 'H', actor.clone(), HLCTimestamp::new(100, 0));
+        let root_id = rga.root.clone();
+        let id1 = rga.insert_after(&root_id, 'H', actor.clone(), HLCTimestamp::new(100, 0));
         let id2 = rga.insert_after(&id1, 'e', actor.clone(), HLCTimestamp::new(200, 0));
         let id3 = rga.insert_after(&id2, 'l', actor.clone(), HLCTimestamp::new(300, 0));
         let id4 = rga.insert_after(&id3, 'l', actor.clone(), HLCTimestamp::new(400, 0));
@@ -210,7 +211,8 @@ mod tests {
         let actor = ActorId::new("node1");
         let mut rga = RGA::new(actor.clone());
         
-        let id1 = rga.insert_after(&rga.root, 'A', actor.clone(), HLCTimestamp::new(100, 0));
+        let root_id = rga.root.clone();
+        let id1 = rga.insert_after(&root_id, 'A', actor.clone(), HLCTimestamp::new(100, 0));
         let id2 = rga.insert_after(&id1, 'B', actor.clone(), HLCTimestamp::new(200, 0));
         let _id3 = rga.insert_after(&id2, 'C', actor.clone(), HLCTimestamp::new(300, 0));
         

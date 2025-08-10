@@ -25,7 +25,7 @@ impl LeaseId {
     }
 }
 
-/// What a lease covers - file or directory
+/// What a lease covers - file, directory, or block
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LeaseScope {
     /// Lease on a specific file
@@ -35,6 +35,8 @@ pub enum LeaseScope {
         path: PathBuf,
         recursive: bool,
     },
+    /// Lease on a specific block (for FUSE filesystem)
+    Block(String),
 }
 
 impl LeaseScope {
@@ -49,6 +51,7 @@ impl LeaseScope {
                     path.parent() == Some(dir_path.as_path())
                 }
             }
+            LeaseScope::Block(_) => false, // Blocks don't cover paths
         }
     }
 
@@ -58,22 +61,25 @@ impl LeaseScope {
         let self_path = match self {
             LeaseScope::File(p) => p,
             LeaseScope::Directory { path, .. } => path,
+            LeaseScope::Block(_) => return false, // Blocks can't be compared by path
         };
         
         let other_path = match other {
             LeaseScope::File(p) => p,
             LeaseScope::Directory { path, .. } => path,
+            LeaseScope::Block(_) => return true, // File/Dir scopes are more specific than blocks
         };
 
         // More components = more specific
         self_path.components().count() > other_path.components().count()
     }
 
-    /// Get the path this scope refers to
-    pub fn path(&self) -> &PathBuf {
+    /// Get the path this scope refers to (if applicable)
+    pub fn path(&self) -> Option<&PathBuf> {
         match self {
-            LeaseScope::File(p) => p,
-            LeaseScope::Directory { path, .. } => path,
+            LeaseScope::File(p) => Some(p),
+            LeaseScope::Directory { path, .. } => Some(path),
+            LeaseScope::Block(_) => None, // Blocks don't have filesystem paths
         }
     }
 }

@@ -1,0 +1,56 @@
+// LisFS - O(1) scalable FUSE filesystem binary
+// Demonstrates RHC concepts with a real filesystem interface
+
+use std::env;
+// use fuse3::raw::mount; // TODO: Fix mount API
+use lis::fuse_fs::LisFS;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    
+    if args.len() != 2 {
+        eprintln!("Usage: {} <mountpoint>", args[0]);
+        eprintln!("Example: {} /tmp/lisfs", args[0]);
+        std::process::exit(1);
+    }
+    
+    let mountpoint = &args[1];
+    
+    println!("🚀 Starting LisFS - O(1) Scalable Filesystem");
+    println!("📁 Mounting at: {}", mountpoint);
+    println!("🔧 Features:");
+    println!("   • O(1) metadata lookups via global consistent layer");
+    println!("   • O(1) block reads/writes with lease-based routing");
+    println!("   • Honeycomb data structure for optimal placement");
+    println!("   • Automatic lease migration based on access patterns");
+    println!("   • Linearizable operations across distributed consensus groups\n");
+    
+    // Create the filesystem
+    let fs = LisFS::new();
+    
+    // Note: fuse3::mount uses default mount options
+    
+    println!("🌟 Filesystem ready! Try:");
+    println!("   echo 'Hello RHC!' > {}/test.txt", mountpoint);
+    println!("   cat {}/test.txt", mountpoint);
+    println!("   ls -la {}/", mountpoint);
+    println!("\n🔍 Watch for O(1) operation logs and lease migrations...\n");
+    
+    // Start a background task to periodically print stats
+    let fs_clone = std::sync::Arc::new(fs);
+    let stats_fs = fs_clone.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            stats_fs.print_stats().await;
+        }
+    });
+    
+    // Mount the filesystem (this blocks)
+    // TODO: Fix mount API issue with fuse3
+    eprintln!("❌ Mount functionality not yet implemented - fuse3 API issue");
+    eprintln!("   The filesystem is ready but mount API needs to be fixed");
+    Ok(())
+}

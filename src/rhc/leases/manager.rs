@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Manages lease lifecycle for a node/CG
+#[derive(Debug)]
 pub struct LeaseManager {
     /// HLC for consistent timestamps
     hlc: Arc<HLC>,

@@ -18,6 +18,7 @@ pub enum LeaseStatus {
 }
 
 /// Tracks the state of all leases in a node/CG
+#[derive(Debug)]
 pub struct LeaseState {
     /// All known leases by ID
     leases: HashMap<LeaseId, Lease>,
@@ -53,26 +54,29 @@ impl LeaseState {
     /// Add a lease to the state
     pub fn add_lease(&mut self, lease: Lease) {
         let lease_id = lease.id;
-        let path = lease.scope.path().clone();
         
         // Add to main storage
-        self.leases.insert(lease_id, lease);
+        self.leases.insert(lease_id, lease.clone());
         
-        // Update path index
-        self.path_index
-            .entry(path)
-            .or_insert_with(Vec::new)
-            .push(lease_id);
+        // Update path index (only for file/directory leases)
+        if let Some(path) = lease.scope.path() {
+            self.path_index
+                .entry(path.clone())
+                .or_insert_with(Vec::new)
+                .push(lease_id);
+        }
     }
 
     /// Remove a lease from the state
     pub fn remove_lease(&mut self, lease_id: LeaseId) -> Option<Lease> {
         if let Some(lease) = self.leases.remove(&lease_id) {
-            // Remove from path index
-            if let Some(leases) = self.path_index.get_mut(lease.scope.path()) {
-                leases.retain(|&id| id != lease_id);
-                if leases.is_empty() {
-                    self.path_index.remove(lease.scope.path());
+            // Remove from path index (only for file/directory leases)
+            if let Some(path) = lease.scope.path() {
+                if let Some(leases) = self.path_index.get_mut(path) {
+                    leases.retain(|&id| id != lease_id);
+                    if leases.is_empty() {
+                        self.path_index.remove(path);
+                    }
                 }
             }
             Some(lease)
@@ -105,7 +109,11 @@ impl LeaseState {
 
         // Return the most specific lease (most path components)
         candidates.into_iter()
-            .max_by_key(|lease| lease.scope.path().components().count())
+            .max_by_key(|lease| {
+                lease.scope.path()
+                    .map(|p| p.components().count())
+                    .unwrap_or(0)
+            })
     }
 
     /// Get all active leases held by this node
@@ -159,15 +167,20 @@ impl LeaseState {
         scope: &LeaseScope,
         now: HLCTimestamp,
     ) -> Result<(), &Lease> {
-        // Check if there's already a lease covering this scope
-        if let Some(existing) = self.find_lease_for_path(scope.path(), now) {
-            // If the existing lease is less specific, we can override
-            if scope.is_more_specific_than(&existing.scope) {
-                Ok(())
+        // Check if there's already a lease covering this scope (only for path-based leases)
+        if let Some(path) = scope.path() {
+            if let Some(existing) = self.find_lease_for_path(path, now) {
+                // If the existing lease is less specific, we can override
+                if scope.is_more_specific_than(&existing.scope) {
+                    Ok(())
+                } else {
+                    Err(existing)
+                }
             } else {
-                Err(existing)
+                Ok(())
             }
         } else {
+            // Block leases don't conflict based on paths
             Ok(())
         }
     }
