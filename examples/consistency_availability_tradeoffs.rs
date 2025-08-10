@@ -3,7 +3,6 @@
 use lis::rhc::hlc::{HLC, HLCTimestamp};
 use lis::rhc::leases::{LeaseManager, LeaseScope};
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::time::Duration;
 use std::thread;

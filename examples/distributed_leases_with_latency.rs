@@ -22,6 +22,7 @@ enum StorageType {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 struct WriteRequest {
     id: u64,
     size_bytes: usize,

@@ -1,12 +1,11 @@
 // Real simulation of lease migration between Perth and London
 
-use lis::rhc::hlc::{HLC, HLCTimestamp};
+use lis::rhc::hlc::HLC;
 use lis::rhc::leases::{LeaseManager, LeaseScope};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::thread;
-use std::collections::HashMap;
 
 struct WriteStats {
     total: u64,
@@ -60,7 +59,9 @@ fn main() {
     
     // The file we're accessing
     let file_path = PathBuf::from("/data/dataset.db");
-    let file_scope = LeaseScope::File(file_path.clone());
+    let file_path_perth = file_path.clone();
+    let file_path_london = file_path.clone();
+    let file_scope = LeaseScope::File(file_path);
     
     // Perth initially acquires the lease
     let initial_lease = perth_lease_mgr
@@ -74,12 +75,12 @@ fn main() {
     // Spawn Perth writer thread
     let perth_stats_clone = perth_stats.clone();
     let perth_mgr_clone = perth_lease_mgr.clone();
-    let perth_thread = thread::spawn(move || {
+    let _perth_thread = thread::spawn(move || {
         let mut write_rate = 100; // writes per minute initially
         
         loop {
             // Check if we can write
-            if perth_mgr_clone.can_write(&file_path) {
+            if perth_mgr_clone.can_write(&file_path_perth) {
                 perth_stats_clone.lock().unwrap().record_write();
                 
                 // Simulate write delay
@@ -99,12 +100,12 @@ fn main() {
     // Spawn London writer thread
     let london_stats_clone = london_stats.clone();
     let london_mgr_clone = london_lease_mgr.clone();
-    let london_thread = thread::spawn(move || {
+    let _london_thread = thread::spawn(move || {
         let mut write_rate = 10; // writes per minute initially
         
         loop {
             // Check if we can write
-            if london_mgr_clone.can_write(&file_path) {
+            if london_mgr_clone.can_write(&file_path_london) {
                 london_stats_clone.lock().unwrap().record_write();
                 
                 // Simulate write delay
@@ -126,7 +127,7 @@ fn main() {
         let mut current_holder = "perth";
         
         for minute in 0..5 {
-            thread::sleep(Duration::from_secs(10)); // Check every 10 seconds
+            thread::sleep(Duration::from_secs(2)); // Check every 2 seconds for demo
             
             let perth_wpm = perth_stats.lock().unwrap().writes_per_minute();
             let london_wpm = london_stats.lock().unwrap().writes_per_minute();

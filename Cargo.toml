@@ -6,13 +6,45 @@ edition = "2021"
 [dependencies]
 
 [[example]]
-name = "lease_demo"
-path = "examples/lease_demo.rs"
+name = "basic_lease_operations"
+path = "examples/basic_lease_operations.rs"
 
 [[example]]
-name = "latency_demo"
-path = "examples/latency_demo.rs"
+name = "distributed_leases_with_latency"
+path = "examples/distributed_leases_with_latency.rs"
 
 [[example]]
-name = "cap_demo"
-path = "examples/cap_demo.rs"
+name = "consistency_availability_tradeoffs"
+path = "examples/consistency_availability_tradeoffs.rs"
+
+[[example]]
+name = "lease_migration_with_clock_skew"
+path = "examples/lease_migration_with_clock_skew.rs"
+
+[[example]]
+name = "consensus_group_partition_recovery"
+path = "examples/consensus_group_partition_recovery.rs"
+
+[[example]]
+name = "consensus_group_basics"
+path = "examples/consensus_group_basics.rs"
+
+[[example]]
+name = "state_machine_replication"
+path = "examples/state_machine_replication.rs"
+
+[[example]]
+name = "membership_changes"
+path = "examples/membership_changes.rs"
+
+[[example]]
+name = "proxied_writes_and_ownership"
+path = "examples/proxied_writes_and_ownership.rs"
+
+[[example]]
+name = "latency_driven_lease_migration"
+path = "examples/latency_driven_lease_migration.rs"
+
+[[example]]
+name = "block_level_optimization"
+path = "examples/block_level_optimization.rs"

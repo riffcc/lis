@@ -1,5 +1,5 @@
 use lis::rhc::hlc::{HLC, HLCTimestamp};
-use lis::rhc::leases::{LeaseScope, LeaseManager, Lease, LeaseId};
+use lis::rhc::leases::{LeaseScope, LeaseManager, LeaseId};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::thread;

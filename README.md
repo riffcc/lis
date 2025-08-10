@@ -6,7 +6,10 @@ Lis is an experimental distributed filesystem intended to stretch the boundaries
 
 We use Riff Hierarchical Consensus (RHC) to achieve strong consistency and availability while tolerating network partitions.
 
-You can read more about RHC in `docs/rhc.md` (temporarily in the synthesis folder).
+### Key Innovation: Intelligent Lease Placement
+Unlike traditional distributed filesystems where data has a fixed "home", Lis dynamically moves write authority (leases) to where data is being actively used. Data is replicated globally for reads, but writes happen locally through intelligent lease migration. This creates the illusion of data following you while maintaining strong consistency.
+
+You can read more about RHC in `docs/` directory.
 
 ## Planned Features
 Performance:
@@ -36,6 +39,41 @@ Security:
 * Run benchmarks: `cargo bench`
 * Run linting: `cargo clippy`
 * Deploy a test cluster: `make test-cluster`
+
+## Demos and Examples
+
+The `examples/` directory contains demonstrations of key RHC concepts:
+
+### Core Concepts
+* `basic_lease_operations` - Demonstrates fundamental lease operations: request, grant, check validity, and revoke
+* `distributed_leases_with_latency` - Shows how leases work in a distributed environment with network latency
+
+### Consensus Groups
+* `consensus_group_basics` - Introduction to consensus groups, leader election, and partition behavior
+* `state_machine_replication` - Demonstrates how replicated state machines maintain consistency
+* `membership_changes` - Shows node join/leave protocols and failure handling
+
+### Clock Synchronization and Fault Tolerance
+* `lease_migration_with_clock_skew` - Demonstrates how RHC handles lease migration even with severely skewed clocks (up to 30s drift)
+* `consensus_group_partition_recovery` - Shows how consensus groups use CRDTs to recover from network partitions and maintain consistency
+
+### System Properties
+* `consistency_availability_tradeoffs` - Interactive demo exploring CAP theorem tradeoffs in different network conditions
+
+### Advanced Features
+* `proxied_writes_and_ownership` - Shows how non-lease holders can still write through proxying
+* `latency_driven_lease_migration` - Automatic lease migration based on access patterns
+
+### Coming Soon
+* `byzantine_fault_tolerance` - BFT consensus with Byzantine nodes
+* `burst_buffer_local_acknowledgment` - Fast local writes with eventual global consistency
+* `gossip_protocol_propagation` - Efficient state propagation via gossip
+* `cryptographic_lease_verification` - Verifiable lease proofs using cryptography
+
+Run any demo with:
+```bash
+cargo run --example <demo_name>
+```
 
 ## Development methodology
 Developing a distributed filesystem nearly from scratch is very difficult.
