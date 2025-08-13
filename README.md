@@ -1,5 +1,7 @@
 # lis
-Life is short, but data should live forever
+> Life is short, but data should live forever
+
+A distributed filesystem implemented using FUSE and Rust.
 
 ## Building
 First make sure you have `fuse3` dev installed:
